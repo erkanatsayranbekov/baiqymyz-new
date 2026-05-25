@@ -1,0 +1,32 @@
+from django.contrib import admin
+from django.conf import settings
+from django.conf.urls.static import static
+from django.urls import include, path
+from rest_framework import routers
+from authentication import views
+
+router = routers.SimpleRouter()
+router.register(r'users', views.UserViewSet)
+router.register(r'votings', views.VotingViewSet)
+router.register(r'participants', views.ParticipantViewSet)
+router.register(r'votes', views.VoteViewSet)
+
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('api/', include([
+        path('', include(router.urls)),
+        path('auth/me/', views.AuthMeView.as_view(), name='auth-me'),
+        path('auth/otp/request/', views.OTPRequestView.as_view(), name='otp-request'),
+        path('auth/otp/verify/', views.OTPVerifyView.as_view(), name='otp-verify'),
+        path('manager/auth/request-otp/', views.ManagerAuthRequestOTPView.as_view(), name='manager-auth-request-otp'),
+        path('manager/auth/verify/', views.ManagerAuthVerifyView.as_view(), name='manager-auth-verify'),
+        path('manager/auth/me/', views.ManagerAuthMeView.as_view(), name='manager-auth-me'),
+        path('manager/otp/generate/', views.ManagerOTPGenerateView.as_view(), name='manager-otp-generate'),
+        path('register/', views.RegisterView.as_view(), name='register'),
+        path('login/', views.LoginView.as_view(), name='login')
+    ])),
+]
+
+if settings.SERVE_MEDIA_IN_DJANGO:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
