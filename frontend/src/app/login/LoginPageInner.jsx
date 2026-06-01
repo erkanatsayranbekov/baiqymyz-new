@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { ToastContainer, toast } from "react-toastify";
 import { useRouter } from "next/navigation";
 import AuthService from "~/app/services/auth";
@@ -24,6 +24,8 @@ export default function LoginPage() {
   const [code, setCode] = useState("");
   const [otpSent, setOtpSent] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [resendAfter, setResendAfter] = useState(0);
+  const requestOtpInFlight = useRef(false);
   const router = useRouter();
   const rawNext = searchParams.get("next");
   const nextUrl = rawNext?.startsWith("/") && !rawNext.startsWith("//")
@@ -38,12 +40,57 @@ export default function LoginPage() {
     if (passwordChanged) toast.success(t("auth.password_changed_success"));
   }, []);
 
+  useEffect(() => {
+    if (resendAfter <= 0) return;
+
+    const timer = window.setTimeout(() => {
+      setResendAfter((current) => Math.max(current - 1, 0));
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [resendAfter]);
+
+  /**
+   * @param {unknown} value
+   */
+  const normalizeDelay = (value) => {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? Math.max(Math.ceil(numberValue), 0) : 0;
+  };
+
+  /**
+   * @param {any} data
+   */
+  const applyOtpRequestState = (data) => {
+    const nextResendAfter = normalizeDelay(data?.resend_after ?? data?.retry_after);
+    setOtpSent(true);
+    setResendAfter(nextResendAfter);
+
+    if (data?.reused) {
+      toast.info(t("auth.otp_already_sent"));
+      return;
+    }
+
+    if (data?.manual_fallback_required) {
+      toast.info(t("auth.otp_manual_fallback_required"));
+      return;
+    }
+
+    toast.success(t("auth.otp_sent"));
+  };
+
   /**
    * @param {any} error
    */
   const showOtpError = (error) => {
     const status = error?.response?.status;
     if (status === 429) {
+      const retryAfter = normalizeDelay(error?.response?.data?.retry_after);
+      if (retryAfter > 0) {
+        setResendAfter(retryAfter);
+        toast.error(t("auth.otp_too_many_requests_with_retry", { seconds: retryAfter }));
+        return;
+      }
       toast.error(t("auth.otp_too_many_requests"));
       return;
     }
@@ -55,20 +102,23 @@ export default function LoginPage() {
   };
 
   const handleRequestOtp = async () => {
+    if (requestOtpInFlight.current) return;
+
     if (!phone) {
       toast.error(t("auth.phone_placeholder"));
       return;
     }
 
+    requestOtpInFlight.current = true;
     setLoading(true);
     try {
-      await AuthService.requestOtp(phone);
-      setOtpSent(true);
-      toast.success(t("auth.otp_sent"));
+      const response = await AuthService.requestOtp(phone);
+      applyOtpRequestState(response.data);
     } catch (error) {
       showOtpError(error);
       console.error(error);
     } finally {
+      requestOtpInFlight.current = false;
       setLoading(false);
     }
   };
@@ -88,6 +138,7 @@ export default function LoginPage() {
 
         if (phoneNumber) localStorage.setItem("phone", phoneNumber);
         if (token) localStorage.setItem("authToken", token);
+        AuthService.notifyAuthChanged();
 
         try {
           const me = await AuthService.getMe();
@@ -160,18 +211,24 @@ export default function LoginPage() {
               type="button"
               onClick={otpSent ? handleVerifyOtp : handleRequestOtp}
               loading={loading}
-              disabled={loading}
+              disabled={loading || (!otpSent && resendAfter > 0)}
             >
-              {otpSent ? t("auth.otp_verify") : t("auth.otp_get_code")}
+              {!otpSent && resendAfter > 0
+                ? t("auth.otp_resend_after", { seconds: resendAfter })
+                : otpSent
+                  ? t("auth.otp_verify")
+                  : t("auth.otp_get_code")}
             </Button>
             {otpSent && (
               <button
                 type="button"
                 className="text-lg text-white underline disabled:opacity-60"
-                disabled={loading}
+                disabled={loading || resendAfter > 0}
                 onClick={handleRequestOtp}
               >
-                {t("auth.otp_resend")}
+                {resendAfter > 0
+                  ? t("auth.otp_resend_after", { seconds: resendAfter })
+                  : t("auth.otp_resend")}
               </button>
             )}
             <div className="mt-4 border-t border-white/30 pt-4 text-center">

@@ -1,357 +1,473 @@
 "use client";
 
 import Image from "next/image";
-import { YMaps, Map, Placemark } from "@pbe/react-yandex-maps";
-import { useTranslation } from "react-i18next";
-import LanguageSwitcher from "~/components/LangSwitcher";
-import { useRouter } from "next/navigation";
-import Section from "~/components/Section";
-import Footer from "~/components/Footer";
-import Button from "~/components/Button";
-import Header from "~/components/Header";
 import Link from "next/link";
-import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Map, Placemark, YMaps } from "@pbe/react-yandex-maps";
+import type { ReactNode } from "react";
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import AuthService from "~/app/services/auth";
+import LanguageSwitcher from "~/components/LangSwitcher";
 
-export default function Home() {
+const cultureCards = [
+  { image: "/landing/0831.png", key: "kumys" },
+  { image: "/landing/0832.png", key: "horse" },
+  { image: "/landing/0833.png", key: "showoff" },
+  { image: "/landing/0834.png", key: "participants" },
+  { image: "/landing/0835.png", key: "food" },
+];
+
+const sportCards = [
+  { image: "/landing/0821.png", label: "АСАУ ҮЙРЕТУ" },
+  { image: "/landing/0822.png", label: "ШАЛУ" },
+  { image: "/landing/0823.png", label: "АУДАРЫСПАҚ" },
+  { image: "/landing/0824.png", label: "ҚҰМАЙ ТАЗЫ САЙЫСЫ" },
+  { image: "/landing/0825.png", label: "ҚОШҚАР КӨТЕРУ" },
+  { image: "/landing/0826.png", label: "МЕШКЕЙЛЕР ЖАРЫСЫ" },
+];
+
+const scienceCards = [
+  {
+    image: "/landing/0837.png",
+    title: "science_1_title",
+    name: "science_1_name",
+    description: "science_1_description",
+  },
+  {
+    image: "/landing/0839.jpg",
+    title: "science_2_title",
+    name: "science_2_name",
+    description: "science_2_description",
+  },
+  {
+    image: "/landing/0840.jpg",
+    title: "science_3_title",
+    name: "science_3_name",
+    description: "science_3_description",
+  },
+  {
+    image: "/landing/0837.png",
+    title: "science_4_title",
+    name: "science_4_name",
+    description: "science_4_description",
+  },
+];
+
+const youtubeCards = [
+  "/landing/0845.png",
+  "/landing/0846.jpg",
+  "/landing/0847.png",
+];
+
+const EVENT_COORDINATES: [number, number] = [49.4129, 75.4743];
+
+export default function HomePage() {
   const { t } = useTranslation("common");
-  const [open, setOpen] = useState(false);
   const router = useRouter();
- 
+  const [open, setOpen] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  useEffect(() => {
+    const syncAuth = () => {
+      setIsAuthenticated(Boolean(localStorage.getItem("authToken")));
+    };
+
+    syncAuth();
+    window.addEventListener("storage", syncAuth);
+    window.addEventListener("auth-changed", syncAuth);
+
+    return () => {
+      window.removeEventListener("storage", syncAuth);
+      window.removeEventListener("auth-changed", syncAuth);
+    };
+  }, []);
+
+  const handleLogout = () => {
+    AuthService.logoutLocal();
+    setOpen(false);
+    router.push("/");
+  };
+
+  const closeMenu = () => setOpen(false);
+
   return (
-    <main className="bg-[url(/background.png)] bg-contain min-h-screen flex flex-col">
-      <div className="max-w-[1500px] lg:w-[1200px] mx-auto bg-white flex flex-col">
-        <header className="bg-[url(/landing/0801.png)] bg-cover bg-center h-144 lg:h-[700px] relative overflow-hidden p-6 lg:p-12">
-          <div className="absolute inset-0 bg-black/35" aria-hidden="true" />
-          <Link href="/" aria-label="Baiqymyz">
-            <Image
-              className="absolute left-4 top-4 lg:left-12 lg:top-10 w-24 m-0"
-              height={200}
-              width={200}
-              alt="Baiqymyz"
-              src={"/landing/logo.png"}
+    <main className="min-h-screen overflow-x-hidden bg-[#f3cf77] bg-[url('/landing/0801_original.png')] bg-repeat">
+      <div className="mx-auto flex w-full max-w-[1200px] flex-col overflow-hidden bg-[#f6d684] shadow-2xl shadow-amber-950/20">
+        <section className="relative min-h-[700px] overflow-hidden bg-[url('/landing/0801.png')] bg-cover bg-center px-5 py-5 sm:px-8 lg:px-14">
+          <div className="absolute inset-0 bg-gradient-to-r from-black/55 via-black/25 to-transparent" />
+          <div className="absolute inset-x-0 bottom-0 h-36 bg-gradient-to-t from-black/30 to-transparent" />
+
+          <div className="relative z-20 flex items-start justify-between gap-6">
+            <Link href="/" aria-label="Baiqymyz" onClick={closeMenu}>
+              <Image
+                src="/landing/logo.png"
+                alt="Baiqymyz"
+                width={220}
+                height={160}
+                priority
+                className="h-auto w-28 sm:w-36 lg:w-44"
+              />
+            </Link>
+
+            <button
+              type="button"
+              className="z-30 flex h-11 w-11 items-center justify-center rounded-xl bg-white shadow-md md:hidden"
+              onClick={() => setOpen((current) => !current)}
+              aria-label={open ? "Close navigation" : "Open navigation"}
+            >
+              {open ? (
+                <span className="relative block h-6 w-6">
+                  <span className="absolute left-0 top-1/2 h-0.5 w-6 rotate-45 bg-orange" />
+                  <span className="absolute left-0 top-1/2 h-0.5 w-6 -rotate-45 bg-orange" />
+                </span>
+              ) : (
+                <span className="flex flex-col gap-1.5">
+                  <span className="block h-0.5 w-6 bg-orange" />
+                  <span className="block h-0.5 w-6 bg-orange" />
+                  <span className="block h-0.5 w-6 bg-orange" />
+                </span>
+              )}
+            </button>
+
+            <div
+              className={`fixed inset-0 z-10 bg-black/20 transition-opacity md:hidden ${
+                open ? "block" : "hidden"
+              }`}
+              onClick={closeMenu}
             />
-          </Link>
-          <button
-            className="absolute z-30 top-6 right-6 flex flex-col gap-1 w-10 h-10 justify-center items-center bg-white rounded shadow-md md:hidden"
-            onClick={() => setOpen((prev) => !prev)}
-            aria-label={open ? "Close sidebar" : "Open sidebar"}
-          >
-            {open ? (
-              <span className="block w-6 h-6 relative">
-                <span className="absolute left-0 top-1/2 w-6 h-0.5 bg-orange rotate-45"></span>
-                <span className="absolute left-0 top-1/2 w-6 h-0.5 bg-orange -rotate-45"></span>
-              </span>
-            ) : (
-              <>
-                <span className="block w-6 h-0.5 bg-orange"></span>
-                <span className="block w-6 h-0.5 bg-orange"></span>
-                <span className="block w-6 h-0.5 bg-orange"></span>
-              </>
-            )}
-          </button>
-          <div
-            className={`fixed inset-0 bg-transparent bg-opacity-30 z-10 transition-opacity duration-300 ${
-              open ? "block" : "hidden"
-            }`}
-            onClick={() => setOpen(false)}
-          />
-          <nav
-            className={`fixed top-0 right-0 h-full w-64 bg-white shadow-lg z-20 transform transition-transform duration-300 ${
-              open ? "translate-x-0" : "translate-x-full"
-            } md:static md:translate-x-0  md:bg-transparent md:shadow-none md:w-auto md:h-auto md:flex md:justify-end md:items-center md:pt-4 md:pr-4 md:gap-4`}
-          >
-            <ul className="flex flex-col items-baseline lg:items-center gap-6 p-8 md:flex-row md:gap-8 md:p-0 md:bg-[rgba(255,255,255,0.15)] md:max-w-[80%] md:py-2 md:px-4 md:rounded-xl">
-              <li className="text-orange md:text-white md:bg-[rgba(255,255,255,0.3)] md:px-2 md:rounded-lg cursor-pointer">
-                <Link href="/">{t("nav.home")}</Link>
-              </li>
-              <li className="text-orange md:text-white md:bg-[rgba(255,255,255,0.3)] md:px-2 md:rounded-lg cursor-pointer">
-                <Link href="/#program">{t("nav.program")}</Link>
-              </li>
-              <li className="text-orange md:text-white md:bg-[rgba(255,255,255,0.3)] md:px-2 md:rounded-lg cursor-pointer">
-                <Link href="/login">{t("nav.login_sms")}</Link>
-              </li>
-              <li className="text-orange md:text-white md:bg-[rgba(255,255,255,0.3)] md:px-2 md:rounded-lg cursor-pointer">
-                <Link href="/#contacts">{t("nav.contact")}</Link>
-              </li>
-            </ul>
-            <div className="px-8 lg:px-0">
-              <LanguageSwitcher />
-            </div>
-          </nav>
-          <div className="relative h-full flex flex-col justify-end lg:justify-center items-baseline text-center lg:text-left lg:w-2xl">
-            <div className="mb-20">
-              <h1 className="text-white text-2xl lg:text-4xl font-bold drop-shadow-[0_3px_12px_rgba(0,0,0,0.85)]">
-                {t("landing.title")}
-              </h1>
-            </div>
-            <Button onClick={() => router.push("/vote")}>
-              {t("landing.button")}
-            </Button>
-          </div>
-        </header>
-        <Image
-          className="w-full top-0"
-          height={20}
-          width={500}
-          alt="image"
-          src="/oyu_2_small.png"
-        />
 
-        <div className="flex flex-col lg:flex-row p-6 lg:p-12 gap-16 lg:gap-32">
-          <div className="p-4 text-white text-center font-bold bg-linear-to-r from-yellow-500 to-orange-400 rounded-lg shadow-lg w-full lg:w-1/2 flex-1">
-            <h1 className="text-4xl">«BAI QYMYZ 2025»</h1>
-            <h1 className="text-3xl">{t("landing.date")}</h1>
-            <h1 className="text-xl">{t("landing.location")}</h1>
+            <nav
+              className={`fixed right-0 top-0 z-20 h-full w-72 transform bg-white shadow-2xl transition-transform duration-300 md:static md:h-auto md:w-auto md:translate-x-0 md:bg-transparent md:shadow-none ${
+                open ? "translate-x-0" : "translate-x-full"
+              }`}
+            >
+              <div className="flex h-full flex-col gap-6 p-8 md:h-auto md:flex-row md:items-center md:p-0">
+                <div className="flex flex-col gap-4 rounded-2xl md:flex-row md:items-center md:bg-white/15 md:p-2 md:backdrop-blur-sm">
+                  <Link
+                    href="/"
+                    onClick={closeMenu}
+                    className="rounded-lg px-3 py-2 text-sm font-extrabold text-orange transition hover:bg-orange/10 md:bg-white/30 md:text-white md:hover:bg-white/20"
+                  >
+                    {t("nav.home")}
+                  </Link>
+                  <Link
+                    href="/#program"
+                    onClick={closeMenu}
+                    className="rounded-lg px-3 py-2 text-sm font-extrabold text-orange transition hover:bg-orange/10 md:bg-white/30 md:text-white md:hover:bg-white/20"
+                  >
+                    {t("nav.program")}
+                  </Link>
+                  {isAuthenticated ? (
+                    <button
+                      type="button"
+                      onClick={handleLogout}
+                      className="rounded-lg px-3 py-2 text-left text-sm font-extrabold text-orange transition hover:bg-orange/10 md:bg-white/30 md:text-white md:hover:bg-white/20"
+                    >
+                      {t("nav.logout")}
+                    </button>
+                  ) : (
+                    <Link
+                      href="/login"
+                      onClick={closeMenu}
+                      className="rounded-lg px-3 py-2 text-sm font-extrabold text-orange transition hover:bg-orange/10 md:bg-white/30 md:text-white md:hover:bg-white/20"
+                    >
+                      {t("nav.login_sms")}
+                    </Link>
+                  )}
+                  <Link
+                    href="/#contacts"
+                    onClick={closeMenu}
+                    className="rounded-lg px-3 py-2 text-sm font-extrabold text-orange transition hover:bg-orange/10 md:bg-white/30 md:text-white md:hover:bg-white/20"
+                  >
+                    {t("nav.contact")}
+                  </Link>
+                </div>
+                <LanguageSwitcher />
+              </div>
+            </nav>
           </div>
-          <div className="text-orange font-bold flex-1">
-            <p className="block">{t("landing.description")}</p>
-            <p className="block mt-4">{t("landing.description2")}</p>
-          </div>
-        </div>
-        <div className="w-full h-[200px] relative">
-          <Image
-            className="object-cover"
-            fill
-            alt="image"
-            src="/landing/0829.png"
-          />
-        </div>
 
-        <div id="program" className="bg-yellow-500 p-12 scroll-mt-8">
-          <div className="h-auto lg:h-[200px] relative bg-linear-to-r from-yellow-400 to-orange-400 rounded-lg shadow-lg flex p-4 lg:p-10 gap-14">
-            <div className="hidden lg:block lg:flex-1">
-              <Image
-                src={"/landing/0805.png"}
-                alt="image"
-                width={200}
-                height={300}
-                className="absolute -bottom-10 w-fit h-auto hidden lg:block"
-              />
-            </div>
-            <div className="flex-2 flex items-center">
-              <h2 className="text-white text-xl lg:text-5xl font-bold">
-                {t("landing.headline")}
-              </h2>
-            </div>
-          </div>
-          <div className="w-full lg:w-[400px] text-center mx-auto bg-amber-800 mt-20 rounded-2xl shadow-lg">
-            <h1 className="text-white text-2xl py-2 px-6">
-              {t("landing.program")}
+          <div className="relative z-10 mt-20 flex max-w-2xl flex-col items-start gap-8 lg:mt-24">
+            <p className="rounded-full bg-white/20 px-5 py-2 text-sm font-extrabold uppercase tracking-[0.18em] text-white backdrop-blur-sm">
+              {t("landing.event_kicker")}
+            </p>
+            <h1 className="text-4xl font-black uppercase leading-tight text-white drop-shadow-[0_4px_16px_rgba(0,0,0,0.85)] sm:text-5xl lg:text-6xl">
+              {t("landing.title")}
             </h1>
+            <button
+              type="button"
+              onClick={() => router.push("/vote")}
+              className="min-h-14 w-full max-w-xs rounded-2xl bg-white px-8 py-4 text-center text-lg font-black uppercase text-orange shadow-xl shadow-black/30 transition hover:-translate-y-0.5 hover:shadow-2xl"
+            >
+              {t("landing.button")}
+            </button>
           </div>
+        </section>
 
-          <div className="flex justify-between flex-col lg:flex-row gap-4 mt-20">
-            <div className="min-h-lg">
-              <Image
-                src={"/landing/0831.png"}
-                alt="image"
-                width={200}
-                height={300}
-                className="rounded-t-2xl w-full"
-              />
-              <div className="bg-amber-800 text-white min-h-[70px] rounded-b-2xl text-lg font-bold p-2">
-                <p className="b3bc">{t("landing.kumys")}</p>
-              </div>
+        <section className="bg-white px-5 py-10 sm:px-8 lg:px-14">
+          <div className="grid gap-8 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
+            <div className="rounded-3xl bg-[url('/landing/0806.png')] bg-cover bg-center p-8 text-center text-white shadow-xl">
+              <p className="text-3xl font-black uppercase sm:text-4xl">
+                «BAI QYMYZ»
+              </p>
+              <p className="mt-2 text-4xl font-black uppercase sm:text-5xl">
+                {t("landing.date")}
+              </p>
+              <p className="mt-3 text-xl font-black uppercase">
+                {t("landing.location")}
+              </p>
             </div>
-            <div className="min-h-lg">
-              <Image
-                src={"/landing/0832.png"}
-                alt="image"
-                width={200}
-                height={300}
-                className="rounded-t-2xl w-full"
-              />
-              <div className="bg-amber-800 text-white min-h-[70px] rounded-b-2xl text-lg font-bold p-2">
-                <p className="b3bc">{t("landing.horse")}</p>
-              </div>
+            <div className="text-lg font-extrabold uppercase leading-relaxed text-[#b36b09]">
+              <p>{t("landing.description")}</p>
+              <p className="mt-5">{t("landing.description2")}</p>
             </div>
-            <div className="min-h-lg">
-              <Image
-                src={"/landing/0833.png"}
-                alt="image"
-                width={200}
-                height={300}
-                className="rounded-t-2xl w-full"
-              />
-              <div className="bg-amber-800 text-white min-h-[70px] rounded-b-2xl text-lg font-bold p-2">
-                <p className="b3bc">{t("landing.showoff")}</p>
-              </div>
-            </div>
-            <div className="min-h-lg">
-              <Image
-                src={"/landing/0834.png"}
-                alt="image"
-                width={200}
-                height={300}
-                className="rounded-t-2xl w-full"
-              />
-              <div className="bg-amber-800 text-white min-h-[70px] rounded-b-2xl text-lg font-bold p-2">
-                <p className="b3bc">{t("landing.participants")}</p>
-              </div>
-            </div>
-            <div className="min-h-lg">
-              <Image
-                src={"/landing/0835.png"}
-                alt="image"
-                width={200}
-                height={300}
-                className="rounded-t-2xl w-full"
-              />
-              <div className="bg-amber-800 text-white min-h-[70px] rounded-b-2xl text-lg font-bold p-2">
-                <p className="b3bc">{t("landing.food")}</p>
-              </div>
+          </div>
+        </section>
+
+        <section className="relative h-48 bg-white sm:h-56">
+          <Image
+            src="/landing/0829.png"
+            alt={t("landing.gallery_alt")}
+            fill
+            className="object-cover"
+          />
+        </section>
+
+        <section id="program" className="scroll-mt-8 bg-[#f5d17e] px-5 py-14 sm:px-8 lg:px-14">
+          <div className="relative overflow-hidden rounded-3xl bg-[url('/landing/0806.png')] bg-cover bg-center p-7 shadow-xl sm:p-10 lg:min-h-60">
+            <Image
+              src="/landing/0805.png"
+              alt={t("landing.kumys_image_alt")}
+              width={360}
+              height={360}
+              className="absolute -bottom-12 left-2 hidden w-80 lg:block"
+            />
+            <div className="relative z-10 ml-auto max-w-2xl text-white lg:py-8">
+              <p className="text-3xl font-black uppercase sm:text-5xl">
+                «BAI QYMYZ»
+              </p>
+              <p className="mt-2 text-2xl font-black uppercase sm:text-4xl">
+                {t("landing.headline")}
+              </p>
             </div>
           </div>
 
-          <div className="hidden lg:flex bg-[url('/landing/0813.png')] w-full py-16 gap-4 mt-20 justify-end items-center bg-cover rounded-2xl">
-            <div className="w-[40%] text-right mr-20">
-              <h1 className="text-white text-5xl py-2 font-extrabold px-6">
-                ЭТНО-АУЫЛ
-              </h1>
-              <p className="text-white text-lg py-2 px-6">
-                Фестивальде этно ауыл ұсынылады, мұнда келушілер қазақ
-                мәдениетінің дәстүрлеріне толықтай бойлап, ғасырлар бойы
-                сақталып келе жатқан қолөнер көрмесімен танысады. Этно ауылдың
-                әр бұрышы өз тарихын айтып, ұмытылмас әсер қалдырады.
-              </p>
-            </div>
-          </div>
-        </div>
+          <SectionTitle>{t("landing.program")}</SectionTitle>
 
-        <div className="bg-map-section p-12 lg:p-20">
-          <h1 className="text-[#d54013] text-center text-2xl lg:text-5xl font-extrabold mb-20">
-            {t("landing.sport")}
-          </h1>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-y-[30px] md:gap-y-[70px] md:gap-x-[150px] my-[30px]">
-            <div className="flex flex-col items-center justify-center">
-              <Image
-                className="block_5_img"
-                src="/landing/0821.png"
-                width={150}
-                height={150}
-                alt="image"
-              />
-              <p className="text-[#d54013] font-extrabold mt-4 text-lg">
-                АСАУ ҮЙРЕТУ
-              </p>
-            </div>
-            <div className="flex flex-col items-center justify-center">
-              <Image
-                className="block_5_img"
-                src="/landing/0822.png"
-                width={150}
-                height={150}
-                alt="image"
-              />
-              <p className="text-[#d54013] font-extrabold mt-4 text-lg">
-                ШАЛМА САЛУ
-              </p>
-            </div>
-            <div className="flex flex-col items-center justify-center">
-              <Image
-                className="block_5_img"
-                src="/landing/0823.png"
-                width={150}
-                height={150}
-                alt="image"
-              />
-              <p className="text-[#d54013] font-extrabold mt-4 text-lg">
-                АУДАРЫСПАҚ
-              </p>
-            </div>
-            <div className="flex flex-col items-center justify-center">
-              <Image
-                className="block_5_img"
-                src="/landing/0824.png"
-                width={150}
-                height={150}
-                alt="image"
-              />
-              <p className="text-[#d54013] font-extrabold mt-4 text-lg">
-                ҚҰМАЙ ТАЗЫ САЙЫСЫ
-              </p>
-            </div>
-            <div className="flex flex-col items-center justify-center">
-              <Image
-                className="block_5_img"
-                src="/landing/0825.png"
-                width={150}
-                height={150}
-                alt="image"
-              />
-              <p className="text-[#d54013] font-extrabold mt-4 text-lg">
-                ҚОШҚАР СҮЗІСТІРУ
-              </p>
-            </div>
-            <div className="flex flex-col items-center justify-center">
-              <Image
-                className="block_5_img"
-                src="/landing/0826.png"
-                width={150}
-                height={150}
-                alt="image"
-              />
-              <p className="text-[#d54013] font-extrabold mt-4 text-lg">
-                МЕШКЕЙЛЕР ЖАРЫСЫ
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-map-section w-full h-auto py-8 bg-cover">
-          <div className="w-[90%] mx-auto flex flex-col gap-8">
-            <div className="font-extrabold text-orange">
-              <div className="flex gap-3 items-center">
-                <Image
-                  src={"/pin.svg"}
-                  alt="pin"
-                  width={200}
-                  height={200}
-                  className="w-[35px] h-[35px]"
-                />
-                <div>
-                  <p className="text-md font-bold uppercase">
-                    {t("home.astana")}
-                  </p>
-                  <p className="text-md font-bold uppercase">
-                    {t("home.hippodrome")}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+            {cultureCards.map((card) => (
+              <article
+                key={card.key}
+                className="overflow-hidden rounded-3xl bg-[#8a4f1e] shadow-xl shadow-amber-950/15"
+              >
+                <div className="relative h-64 lg:h-72">
+                  <Image
+                    src={card.image}
+                    alt={t(`landing.${card.key}`)}
+                    fill
+                    sizes="(min-width: 1024px) 210px, (min-width: 640px) 50vw, 100vw"
+                    className="object-cover"
+                  />
+                </div>
+                <div className="flex min-h-20 items-center bg-[url('/landing/0836.png')] bg-cover px-5 py-4">
+                  <p className="text-lg font-black uppercase leading-tight text-white">
+                    {t(`landing.${card.key}`)}
                   </p>
                 </div>
-              </div>
-            </div>
-            <div className="border-orange border-2 rounded-4xl overflow-hidden">
-              <YMaps
-                query={{
-                  lang: "ru_RU",
-                  apikey: "536168cc-8dbb-4923-a06f-9a6bd5a9cf15",
-                }}
-              >
-                <Map
-                  defaultState={{ center: [51.0698, 71.3868], zoom: 15 }}
-                  className=" w-full h-[300px]"
-                >
-                  <Placemark
-                    geometry={[51.0698, 71.3868]}
-                    options={{ iconColor: "#f00" }}
-                  />
-                </Map>
-              </YMaps>
+              </article>
+            ))}
+          </div>
+
+          <div className="mt-14 overflow-hidden rounded-3xl bg-[url('/landing/0813.png')] bg-cover bg-center p-8 shadow-xl lg:p-14">
+            <div className="ml-auto max-w-md text-white">
+              <h2 className="text-4xl font-black uppercase lg:text-5xl">
+                {t("landing.ethno_title")}
+              </h2>
+              <p className="mt-5 text-base font-bold leading-relaxed lg:text-lg">
+                {t("landing.ethno_text")}
+              </p>
             </div>
           </div>
-        </div>
+        </section>
 
-        <Image
-          priority
-          src={"/map_section2.png"}
-          alt="pin"
-          width={200}
-          height={200}
-          className="bg-contain w-full h-auto"
-        />
-        <div id="contacts" className="scroll-mt-8">
-          <Footer />
-        </div>
+        <section className="bg-white px-5 py-14 sm:px-8 lg:px-14">
+          <SectionTitle>{t("landing.science_title")}</SectionTitle>
+          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+            {scienceCards.map((card) => (
+              <article
+                key={card.title}
+            className="flex min-h-[370px] flex-col rounded-3xl bg-[url('/landing/0838.png')] bg-cover bg-center p-5 text-white shadow-xl shadow-amber-950/15"
+              >
+                <p className="min-h-24 text-sm font-black uppercase leading-snug">
+                  {t(`landing.${card.title}`)}
+                </p>
+                <Image
+                  src={card.image}
+                  alt={t(`landing.${card.name}`)}
+                  width={120}
+                  height={120}
+                  className="mx-auto my-4 h-24 w-24 rounded-full object-cover ring-4 ring-white/60"
+                />
+                <h3 className="text-base font-black leading-tight">
+                  {t(`landing.${card.name}`)}
+                </h3>
+                <p className="mt-3 text-xs font-semibold leading-relaxed text-white/90">
+                  {t(`landing.${card.description}`)}
+                </p>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="bg-[#f2f4dd] px-5 py-14 sm:px-8 lg:px-14">
+          <h2 className="text-center text-3xl font-black uppercase text-[#d54013] sm:text-5xl">
+            {t("landing.sport")}
+          </h2>
+          <div className="mt-10 grid gap-x-10 gap-y-8 sm:grid-cols-2 lg:grid-cols-3">
+            {sportCards.map((card) => (
+              <div key={card.image} className="flex flex-col items-center text-center">
+                <Image
+                  src={card.image}
+                  alt={card.label}
+                  width={150}
+                  height={150}
+                  className="h-32 w-32 object-contain"
+                />
+                <p className="mt-4 text-lg font-black uppercase text-[#d54013]">
+                  {card.label}
+                </p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="bg-white px-5 py-14 sm:px-8 lg:px-14">
+          <div className="mb-8 flex flex-col gap-4 text-orange">
+            <h2 className="text-3xl font-black uppercase sm:text-5xl">
+              {t("landing.map_title")}
+            </h2>
+            <div className="flex items-center gap-3 font-black uppercase">
+              <Image src="/pin.svg" alt="" width={36} height={36} className="h-9 w-9" />
+              <span>{t("landing.map_location")}</span>
+            </div>
+          </div>
+          <div className="overflow-hidden rounded-3xl border-4 border-orange shadow-xl">
+            <YMaps
+              query={{
+                lang: "ru_RU",
+                apikey: "536168cc-8dbb-4923-a06f-9a6bd5a9cf15",
+              }}
+            >
+              <Map
+                defaultState={{ center: EVENT_COORDINATES, zoom: 13 }}
+                className="h-[340px] w-full"
+              >
+                <Placemark geometry={EVENT_COORDINATES} options={{ iconColor: "#d54013" }} />
+              </Map>
+            </YMaps>
+          </div>
+        </section>
+
+        <section className="bg-[#f2f4dd] px-5 py-14 sm:px-8 lg:px-14">
+          <SectionTitle>{t("landing.youtube_title")}</SectionTitle>
+          <div className="grid gap-5 md:grid-cols-3">
+            {youtubeCards.map((image) => (
+              <Link
+                key={image}
+                href="https://www.youtube.com/@BaiQymyz"
+                target="_blank"
+                rel="noreferrer"
+                className="group relative h-56 overflow-hidden rounded-3xl shadow-xl"
+              >
+                <Image
+                  src={image}
+                  alt={t("landing.youtube_title")}
+                  fill
+                  sizes="(min-width: 768px) 33vw, 100vw"
+                  className="object-cover transition duration-500 group-hover:scale-105"
+                />
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        <footer
+          id="contacts"
+          className="scroll-mt-8 rounded-t-3xl bg-[#3c9f9f] px-5 py-10 text-white sm:px-8 lg:px-14"
+        >
+          <div className="grid gap-8 lg:grid-cols-[160px_1fr_120px] lg:items-center">
+            <Image
+              src="/landing/logo_footer.png"
+              alt="Baiqymyz"
+              width={140}
+              height={140}
+              className="h-auto w-32"
+            />
+            <div className="flex flex-col items-start gap-5 lg:items-center">
+              <div className="flex flex-wrap gap-3">
+                <Link href="/" className="rounded-lg bg-white/20 px-3 py-2 text-sm font-bold">
+                  {t("nav.home")}
+                </Link>
+                <Link
+                  href="/#program"
+                  className="rounded-lg bg-white/20 px-3 py-2 text-sm font-bold"
+                >
+                  {t("nav.program")}
+                </Link>
+                <Link
+                  href="/#contacts"
+                  className="rounded-lg bg-white/20 px-3 py-2 text-sm font-bold"
+                >
+                  {t("nav.contact")}
+                </Link>
+              </div>
+              <div className="flex flex-col gap-3 text-sm font-bold md:flex-row md:items-center md:gap-8">
+                <a href="mailto:info@baiqymyz.kz" className="flex items-center gap-2">
+                  <Image src="/landing/mail_white.png" alt="" width={24} height={24} />
+                  info@baiqymyz.kz
+                </a>
+                <a
+                  href="https://api.whatsapp.com/send/?phone=77762010005&text=Здравствуйте%21%0A%0AХочу+узнать+про+Bai Qymyz .%0A%0A&type=phone_number&app_absent=0"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-2"
+                >
+                  <Image src="/landing/whatsapp_white.png" alt="" width={24} height={24} />
+                  WhatsApp
+                </a>
+                <a
+                  href="https://www.instagram.com/baiqymyz.kz/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-2"
+                >
+                  <Image src="/landing/instagram_white.png" alt="" width={24} height={24} />
+                  baiqymyz.kz
+                </a>
+              </div>
+              <p className="font-black uppercase">Karkaraly 2026</p>
+            </div>
+            <Image
+              src="/landing/0827.png"
+              alt=""
+              width={120}
+              height={120}
+              className="hidden h-auto w-28 lg:block"
+            />
+          </div>
+        </footer>
       </div>
     </main>
+  );
+}
+
+function SectionTitle({ children }: { children: ReactNode }) {
+  return (
+    <div className="my-10 flex justify-center">
+      <h2 className="rounded-2xl bg-[url('/landing/0815.png')] bg-cover bg-center px-8 py-4 text-center text-2xl font-black uppercase text-white shadow-lg sm:text-3xl">
+        {children}
+      </h2>
+    </div>
   );
 }

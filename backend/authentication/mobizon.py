@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,18 +25,37 @@ def mask_phone(phone):
     return f'{phone[:4]}***{phone[-4:]}'
 
 
+def mask_sensitive_text(value):
+    if not isinstance(value, str):
+        return value
+
+    def replace_digits(match):
+        digits = match.group(0)
+        if len(digits) <= 6:
+            return '***'
+        return mask_phone(digits)
+
+    return re.sub(r'\d{4,}', replace_digits, value)
+
+
 def sanitize_mobizon_data(value):
     if isinstance(value, dict):
         sanitized = {}
         for key, item in value.items():
-            if str(key).lower() in {'apikey', 'recipient', 'phone', 'to', 'text'}:
+            key_lower = str(key).lower()
+            if key_lower in {'apikey', 'text'}:
                 sanitized[key] = '***'
+            elif key_lower in {'recipient', 'phone', 'to'}:
+                sanitized[key] = sanitize_mobizon_data(mask_sensitive_text(item))
             else:
                 sanitized[key] = sanitize_mobizon_data(item)
         return sanitized
 
     if isinstance(value, list):
         return [sanitize_mobizon_data(item) for item in value]
+
+    if isinstance(value, str):
+        return mask_sensitive_text(value)
 
     return value
 

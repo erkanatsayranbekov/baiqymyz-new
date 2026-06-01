@@ -32,6 +32,7 @@ from django.utils import timezone
 from .otp import (
     OTPDeliveryError,
     OTPDisabledError,
+    OTPManualFallbackRequired,
     OTPRateLimitedError,
     OTPService,
     OTPVerificationError,
@@ -114,6 +115,33 @@ def audit_manager_otp_request(request, phone='', result=ManagerOTPAuditLog.RESUL
         result=result,
         error_reason=error_reason[:255],
     )
+
+
+def otp_request_payload(challenge):
+    return {
+        'reused': bool(getattr(challenge, 'otp_reused', False)),
+        'resend_after': getattr(challenge, 'otp_resend_after', 0),
+        'expires_in': getattr(challenge, 'otp_expires_in', 0),
+    }
+
+
+def otp_rate_limited_payload(error):
+    payload = {'detail': 'Too many OTP requests.'}
+    retry_after = getattr(error, 'retry_after', None)
+    if retry_after is not None:
+        payload['retry_after'] = retry_after
+    return payload
+
+
+def otp_manual_fallback_payload(error):
+    payload = {
+        'detail': 'SMS delivery is unavailable. Ask a manager for the OTP code.',
+        'manual_fallback_required': True,
+    }
+    challenge = getattr(error, 'challenge', None)
+    if challenge is not None:
+        payload.update(otp_request_payload(challenge))
+    return payload
 
 
 def manager_user_payload(user):
@@ -483,13 +511,15 @@ class RegisterView(generics.CreateAPIView):
 
         if settings.OTP_AUTH_ENABLED:
             try:
-                OTPService().request_otp(phone, request)
-            except OTPRateLimitedError:
-                return Response({'detail': 'Too many OTP requests.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+                challenge = OTPService().request_otp(phone, request)
+            except OTPRateLimitedError as error:
+                return Response(otp_rate_limited_payload(error), status=status.HTTP_429_TOO_MANY_REQUESTS)
+            except OTPManualFallbackRequired as error:
+                return Response(otp_manual_fallback_payload(error), status=status.HTTP_202_ACCEPTED)
             except OTPDeliveryError:
                 return Response({'detail': 'OTP could not be sent.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-            return Response({"detail": "OTP sent"}, status=status.HTTP_200_OK)
+            return Response({'detail': 'OTP sent', **otp_request_payload(challenge)}, status=status.HTTP_200_OK)
 
         if not settings.LEGACY_PASSWORD_AUTH_ENABLED:
             return Response({"detail": "Legacy password auth is disabled."}, status=status.HTTP_410_GONE)
@@ -583,15 +613,17 @@ class ManagerAuthRequestOTPView(APIView):
             return Response({'detail': 'Invalid manager credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
 
         try:
-            ticket, _challenge = OTPService().request_manager_login_otp(phone, user, request)
+            ticket, challenge = OTPService().request_manager_login_otp(phone, user, request)
         except OTPDisabledError:
             return Response({'detail': 'OTP authentication is disabled.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except OTPRateLimitedError:
-            return Response({'detail': 'Too many OTP requests.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except OTPRateLimitedError as error:
+            return Response(otp_rate_limited_payload(error), status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except OTPManualFallbackRequired as error:
+            return Response(otp_manual_fallback_payload(error), status=status.HTTP_202_ACCEPTED)
         except OTPDeliveryError:
             return Response({'detail': 'OTP could not be sent.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        return Response({'detail': 'OTP sent', 'ticket': ticket}, status=status.HTTP_200_OK)
+        return Response({'detail': 'OTP sent', 'ticket': ticket, **otp_request_payload(challenge)}, status=status.HTTP_200_OK)
 
 
 class ManagerAuthVerifyView(APIView):
@@ -666,15 +698,17 @@ class OTPRequestView(APIView):
         serializer.is_valid(raise_exception=True)
 
         try:
-            OTPService().request_otp(serializer.validated_data['phone'], request)
+            challenge = OTPService().request_otp(serializer.validated_data['phone'], request)
         except OTPDisabledError:
             return Response({'detail': 'OTP authentication is disabled.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except OTPRateLimitedError:
-            return Response({'detail': 'Too many OTP requests.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except OTPRateLimitedError as error:
+            return Response(otp_rate_limited_payload(error), status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except OTPManualFallbackRequired as error:
+            return Response(otp_manual_fallback_payload(error), status=status.HTTP_202_ACCEPTED)
         except OTPDeliveryError:
             return Response({'detail': 'OTP could not be sent.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        return Response({'detail': 'OTP sent'}, status=status.HTTP_200_OK)
+        return Response({'detail': 'OTP sent', **otp_request_payload(challenge)}, status=status.HTTP_200_OK)
 
 
 class ManagerOTPGenerateView(APIView):

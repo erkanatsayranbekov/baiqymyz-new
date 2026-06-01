@@ -1,6 +1,7 @@
 from unittest.mock import patch
 from datetime import timedelta
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
@@ -14,8 +15,9 @@ from rest_framework.throttling import ScopedRateThrottle
 from django.utils import timezone
 
 from .models import ManagerAuthSession, ManagerOTPAuditLog, OTPChallenge, Participant, Vote, VoteHistory, Voting
-from .otp import OTPService, OTPVerificationError
+from .otp import OTPDeliveryError, OTPManualFallbackRequired, OTPRateLimitedError, OTPService, OTPVerificationError
 from .serializers import normalize_phone
+from .mobizon import MobizonError
 
 
 class DummyMobizonClient:
@@ -25,6 +27,25 @@ class DummyMobizonClient:
     def send_sms(self, recipient, text):
         self.messages.append((recipient, text))
         return {'messageId': 'test-message-id'}
+
+
+class FailingMobizonClient:
+    def send_sms(self, recipient, text):
+        raise MobizonError('Mobizon rejected SMS.', code=2, data={'recipient': '77001234567', 'text': 'secret code'})
+
+
+class RouteUnavailableMobizonClient:
+    def send_sms(self, recipient, text):
+        raise MobizonError(
+            'Invalid recipient.',
+            code=1,
+            data={'recipient': 'Для данного направления отсутствует возможность отправки SMS.'},
+        )
+
+
+class RateLimitedMobizonClient:
+    def send_sms(self, recipient, text):
+        raise MobizonError('Too many requests.', code=30, data={'limit': 'method'})
 
 
 class SingleChoiceVotingTests(APITestCase):
@@ -56,8 +77,8 @@ class SingleChoiceVotingTests(APITestCase):
             {
                 'voting': (voting or self.voting).id,
                 'participant': (participant or self.participant_a).id,
-                'latitude': 51.0698,
-                'longitude': 71.3868,
+                'latitude': 51.160006,
+                'longitude': 71.426149,
             },
             format='json',
             HTTP_HOST='localhost',
@@ -69,8 +90,8 @@ class SingleChoiceVotingTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         vote = Vote.objects.get(voting=self.voting, user=self.user)
         self.assertEqual(Vote.objects.filter(voting=self.voting, user=self.user).count(), 1)
-        self.assertEqual(vote.latitude, 51.0698)
-        self.assertEqual(vote.longitude, 71.3868)
+        self.assertEqual(vote.latitude, 51.160006)
+        self.assertEqual(vote.longitude, 71.426149)
         self.assertEqual(VoteHistory.objects.filter(voting=self.voting, user=self.user).count(), 1)
 
     def test_same_candidate_vote_is_idempotent(self):
@@ -293,6 +314,89 @@ class DeterministicOTPTests(APITestCase):
         self.assertIn(code, self.mobizon.messages[0][1])
         self.assertNotEqual(challenge.otp_hash, code)
         self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
+        self.assertFalse(challenge.otp_reused)
+        self.assertGreaterEqual(challenge.otp_expires_in, 1)
+
+    @override_settings(OTP_RESEND_COOLDOWN_SECONDS=60)
+    def test_request_otp_reuses_active_challenge_without_resending_sms(self):
+        first_challenge = self.service.request_otp(self.phone, self.request())
+        second_challenge = self.service.request_otp(self.phone, self.request())
+
+        self.assertEqual(first_challenge.id, second_challenge.id)
+        self.assertTrue(second_challenge.otp_reused)
+        self.assertGreaterEqual(second_challenge.otp_resend_after, 1)
+        self.assertEqual(len(self.mobizon.messages), 1)
+
+    def test_mobizon_error_marks_challenge_failed(self):
+        service = OTPService(mobizon_client=FailingMobizonClient())
+
+        with self.assertRaises(OTPDeliveryError):
+            service.request_otp(self.phone, self.request())
+
+        challenge = OTPChallenge.objects.get(phone=self.phone)
+        self.assertEqual(challenge.status, OTPChallenge.STATUS_FAILED)
+        self.assertEqual(challenge.metadata['mobizon_code'], 2)
+        self.assertEqual(challenge.metadata['delivery'], 'failed')
+
+    def test_mobizon_rate_limit_is_exposed_as_otp_rate_limit(self):
+        service = OTPService(mobizon_client=RateLimitedMobizonClient())
+
+        with self.assertRaises(OTPRateLimitedError) as context:
+            service.request_otp(self.phone, self.request())
+
+        self.assertEqual(context.exception.retry_after, settings.OTP_RESEND_COOLDOWN_SECONDS)
+        challenge = OTPChallenge.objects.get(phone=self.phone)
+        self.assertEqual(challenge.status, OTPChallenge.STATUS_FAILED)
+        self.assertEqual(challenge.metadata['mobizon_code'], 30)
+
+    def test_mobizon_route_unavailable_creates_manual_fallback_challenge(self):
+        service = OTPService(mobizon_client=RouteUnavailableMobizonClient())
+
+        with self.assertRaises(OTPManualFallbackRequired) as context:
+            service.request_otp(self.phone, self.request())
+
+        challenge = context.exception.challenge
+        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
+        self.assertFalse(challenge.otp_reused)
+        self.assertEqual(challenge.metadata['mobizon_code'], 1)
+        self.assertEqual(challenge.metadata['delivery'], 'manual_fallback')
+
+        code = service.generate_otp(self.phone)
+        token, user, verified_challenge = service.verify_otp(self.phone, code)
+        self.assertTrue(token.key)
+        self.assertEqual(user.username, self.phone)
+        self.assertEqual(verified_challenge.status, OTPChallenge.STATUS_VERIFIED)
+
+    @patch('authentication.otp.MobizonClient', FailingMobizonClient)
+    def test_otp_request_view_returns_delivery_error_when_mobizon_fails(self):
+        response = self.client.post(
+            '/api/auth/otp/request/',
+            {'phone': '+7 (700) 123-45-67'},
+            format='json',
+            HTTP_HOST='localhost',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.data['detail'], 'OTP could not be sent.')
+        challenge = OTPChallenge.objects.get(phone=self.phone)
+        self.assertEqual(challenge.status, OTPChallenge.STATUS_FAILED)
+        self.assertEqual(challenge.metadata['delivery'], 'failed')
+
+    @patch('authentication.otp.MobizonClient', RouteUnavailableMobizonClient)
+    def test_otp_request_view_returns_manual_fallback_when_sms_is_undeliverable(self):
+        response = self.client.post(
+            '/api/auth/otp/request/',
+            {'phone': '+7 (700) 123-45-67'},
+            format='json',
+            HTTP_HOST='localhost',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertTrue(response.data['manual_fallback_required'])
+        self.assertFalse(response.data['reused'])
+        challenge = OTPChallenge.objects.get(phone=self.phone)
+        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
+        self.assertEqual(challenge.metadata['delivery'], 'manual_fallback')
 
     def test_verify_otp_accepts_deterministic_code(self):
         self.service.request_otp(self.phone, self.request())
@@ -451,6 +555,8 @@ class DeterministicOTPTests(APITestCase):
         self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
         self.assertIn('ticket_hash', challenge.metadata)
         self.assertNotEqual(challenge.metadata['ticket_hash'], response.data['ticket'])
+        self.assertFalse(response.data['reused'])
+        self.assertGreaterEqual(response.data['expires_in'], 1)
 
     @patch('authentication.otp.MobizonClient', DummyMobizonClient)
     def test_manager_auth_request_otp_rejects_wrong_password_and_non_staff_generically(self):
@@ -497,6 +603,23 @@ class DeterministicOTPTests(APITestCase):
         self.assertEqual(verify_response.data['user']['username'], self.phone)
         token = Token.objects.get(user=manager)
         self.assertTrue(ManagerAuthSession.objects.filter(user=manager, token=token, revoked_at__isnull=True).exists())
+
+    @patch('authentication.otp.MobizonClient', DummyMobizonClient)
+    def test_manager_auth_reuses_active_otp_and_rotates_ticket_without_resending_sms(self):
+        manager = get_user_model().objects.create_user(username=self.phone, password='manager-pass', is_staff=True)
+        service = OTPService(mobizon_client=self.mobizon)
+
+        first_ticket, first_challenge = service.request_manager_login_otp(self.phone, manager, self.request())
+        second_ticket, second_challenge = service.request_manager_login_otp(self.phone, manager, self.request())
+
+        self.assertEqual(first_challenge.id, second_challenge.id)
+        self.assertNotEqual(first_ticket, second_ticket)
+        self.assertTrue(second_challenge.otp_reused)
+        self.assertEqual(len(self.mobizon.messages), 1)
+
+        code = service.generate_otp(self.phone)
+        verified_challenge = service.verify_manager_login_otp(self.phone, second_ticket, code)
+        self.assertEqual(verified_challenge.status, OTPChallenge.STATUS_VERIFIED)
 
     @patch('authentication.otp.MobizonClient', DummyMobizonClient)
     def test_manager_auth_verify_rejects_wrong_ticket_and_locks_attempts(self):

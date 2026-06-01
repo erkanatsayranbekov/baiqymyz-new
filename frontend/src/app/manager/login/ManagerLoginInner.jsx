@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ToastContainer, toast } from "react-toastify";
 import AuthService from "~/app/services/auth";
@@ -14,7 +14,7 @@ import Section from "~/components/Section";
 const PHONE_MASK_OPTIONS = { mask: "+0 (000) 000-00-00" };
 
 /**
- * @typedef {{ response?: { status?: number } }} ApiError
+ * @typedef {{ response?: { status?: number, data?: { detail?: string, retry_after?: number } } }} ApiError
  */
 
 export default function ManagerLoginInner() {
@@ -27,8 +27,28 @@ export default function ManagerLoginInner() {
   const [ticket, setTicket] = useState("");
   const [otpSent, setOtpSent] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [resendAfter, setResendAfter] = useState(0);
+  const requestOtpInFlight = useRef(false);
 
   const nextUrl = searchParams.get("next") || "/manager/otp";
+
+  useEffect(() => {
+    if (resendAfter <= 0) return;
+
+    const timer = window.setTimeout(() => {
+      setResendAfter((current) => Math.max(current - 1, 0));
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [resendAfter]);
+
+  /**
+   * @param {unknown} value
+   */
+  const normalizeDelay = (value) => {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? Math.max(Math.ceil(numberValue), 0) : 0;
+  };
 
   /**
    * @param {ApiError} error
@@ -40,10 +60,20 @@ export default function ManagerLoginInner() {
       return;
     }
     if (status === 429) {
+      const retryAfter = normalizeDelay(error?.response?.data?.retry_after);
+      if (retryAfter > 0) {
+        setResendAfter(retryAfter);
+        toast.error(t("auth.otp_too_many_requests_with_retry", { seconds: retryAfter }));
+        return;
+      }
       toast.error(t("manager.rate_limited"));
       return;
     }
     if (status === 503) {
+      if (error?.response?.data?.detail === "OTP could not be sent.") {
+        toast.error(t("auth.otp_send_error"));
+        return;
+      }
       toast.error(t("manager.login_disabled"));
       return;
     }
@@ -72,21 +102,28 @@ export default function ManagerLoginInner() {
   };
 
   const handleRequestOtp = async () => {
+    if (requestOtpInFlight.current) return;
+
     if (!phone || !password) {
       toast.error(t("manager.login_required"));
       return;
     }
 
+    requestOtpInFlight.current = true;
     setLoading(true);
     try {
       const response = await AuthService.requestManagerOtp(phone, password);
       setTicket(response.data?.ticket || "");
       setOtpSent(true);
+      setResendAfter(normalizeDelay(response.data?.resend_after));
       setPassword("");
-      toast.success(t("auth.otp_sent"));
+      toast[response.data?.reused ? "info" : "success"](
+        response.data?.reused ? t("auth.otp_already_sent") : t("auth.otp_sent"),
+      );
     } catch (error) {
       showManagerAuthError(/** @type {ApiError} */ (error));
     } finally {
+      requestOtpInFlight.current = false;
       setLoading(false);
     }
   };
@@ -107,6 +144,7 @@ export default function ManagerLoginInner() {
       if (token) localStorage.setItem("authToken", token);
       if (username) localStorage.setItem("phone", username);
       if (expiresAt) localStorage.setItem("managerSessionExpiresAt", expiresAt);
+      AuthService.notifyAuthChanged();
 
       toast.success(t("manager.login_success"));
       router.push(nextUrl);
@@ -178,10 +216,19 @@ export default function ManagerLoginInner() {
             type="button"
             onClick={otpSent ? handleVerify : handleRequestOtp}
             loading={loading}
-            disabled={loading}
+            disabled={loading || (!otpSent && resendAfter > 0)}
           >
-            {otpSent ? t("manager.login_submit") : t("manager.login_get_code")}
+            {!otpSent && resendAfter > 0
+              ? t("auth.otp_resend_after", { seconds: resendAfter })
+              : otpSent
+                ? t("manager.login_submit")
+                : t("manager.login_get_code")}
           </Button>
+          {otpSent && resendAfter > 0 && (
+            <p className="text-center text-sm font-bold text-white/80">
+              {t("auth.otp_resend_after", { seconds: resendAfter })}
+            </p>
+          )}
           {otpSent && (
             <button
               type="button"
@@ -191,6 +238,7 @@ export default function ManagerLoginInner() {
                 setOtpSent(false);
                 setCode("");
                 setTicket("");
+                setResendAfter(0);
               }}
             >
               {t("manager.login_change_phone")}

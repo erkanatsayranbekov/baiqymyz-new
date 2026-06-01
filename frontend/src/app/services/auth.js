@@ -63,11 +63,21 @@ export default class AuthService {
     return await api.get("/api/manager/auth/me/");
   }
 
-  static logoutManagerLocal() {
+  static notifyAuthChanged() {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new Event("auth-changed"));
+  }
+
+  static logoutLocal() {
     if (typeof window === "undefined") return;
     localStorage.removeItem("authToken");
     localStorage.removeItem("phone");
     localStorage.removeItem("managerSessionExpiresAt");
+    AuthService.notifyAuthChanged();
+  }
+
+  static logoutManagerLocal() {
+    AuthService.logoutLocal();
   }
 
   // @ts-ignore

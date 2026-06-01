@@ -1,6 +1,6 @@
 export const EVENT_LOCATION = {
-  latitude: 51.0698,
-  longitude: 71.3868,
+  latitude: 51.160006,
+  longitude: 71.426149,
 };
 
 export const EVENT_RADIUS_METERS = 15000;

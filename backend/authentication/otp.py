@@ -3,6 +3,7 @@ import hmac
 import logging
 import secrets
 from datetime import timedelta
+from math import ceil
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -28,11 +29,19 @@ class OTPDisabledError(OTPError):
 
 
 class OTPRateLimitedError(OTPError):
-    pass
+    def __init__(self, message='OTP request limit exceeded.', retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class OTPDeliveryError(OTPError):
     pass
+
+
+class OTPManualFallbackRequired(OTPDeliveryError):
+    def __init__(self, message='SMS delivery is unavailable for this recipient.', challenge=None):
+        super().__init__(message)
+        self.challenge = challenge
 
 
 class OTPVerificationError(OTPError):
@@ -61,7 +70,12 @@ class OTPService:
 
         ip_address = get_client_ip(request)
         user_agent = request.META.get('HTTP_USER_AGENT', '')
-        self._enforce_rate_limits(phone, ip_address)
+        active_challenge = self._get_active_challenge(phone, settings.OTP_PURPOSE_LOGIN)
+        if active_challenge:
+            logger.info('OTP reused for %s challenge=%s', mask_phone(phone), active_challenge.id)
+            return self._with_request_metadata(active_challenge, reused=True)
+
+        self._enforce_rate_limits(phone, ip_address, settings.OTP_PURPOSE_LOGIN)
 
         code = self.generate_otp(phone)
         now = timezone.now()
@@ -79,14 +93,25 @@ class OTPService:
         try:
             result = self.mobizon_client.send_sms(phone, self._build_sms_text(code))
         except MobizonError as exc:
-            challenge.status = OTPChallenge.STATUS_FAILED
+            is_manual_fallback = self._requires_manual_fallback(exc)
+            challenge.status = OTPChallenge.STATUS_SENT if is_manual_fallback else OTPChallenge.STATUS_FAILED
+            if is_manual_fallback:
+                challenge.sent_at = timezone.now()
             challenge.metadata = {
                 'mobizon_code': exc.code,
                 'error': str(exc),
                 'mobizon_data': sanitize_mobizon_data(exc.data),
+                'delivery': 'manual_fallback' if is_manual_fallback else 'failed',
             }
-            challenge.save(update_fields=['status', 'metadata', 'updated_at'])
+            challenge.save(update_fields=['status', 'sent_at', 'metadata', 'updated_at'])
             logger.warning('OTP delivery failed for %s challenge=%s', mask_phone(phone), challenge.id)
+            if str(exc.code) == '30':
+                raise OTPRateLimitedError(
+                    'Mobizon request limit exceeded.',
+                    retry_after=settings.OTP_RESEND_COOLDOWN_SECONDS,
+                ) from exc
+            if is_manual_fallback:
+                raise OTPManualFallbackRequired(challenge=self._with_request_metadata(challenge, reused=False)) from exc
             raise OTPDeliveryError('OTP delivery failed.') from exc
 
         challenge.status = OTPChallenge.STATUS_SENT
@@ -96,7 +121,7 @@ class OTPService:
         challenge.metadata = {'mobizon_status': 'accepted'}
         challenge.save(update_fields=['status', 'sent_at', 'mobizon_message_id', 'metadata', 'updated_at'])
         logger.info('OTP sent for %s challenge=%s', mask_phone(phone), challenge.id)
-        return challenge
+        return self._with_request_metadata(challenge, reused=False)
 
     def verify_otp(self, phone, code):
         if not settings.OTP_AUTH_ENABLED:
@@ -186,7 +211,20 @@ class OTPService:
 
         ip_address = get_client_ip(request)
         user_agent = request.META.get('HTTP_USER_AGENT', '')
-        self._enforce_rate_limits(phone, ip_address)
+        active_challenge = self._get_active_challenge(phone, settings.OTP_PURPOSE_MANAGER_LOGIN)
+        if active_challenge:
+            ticket = secrets.token_urlsafe(32)
+            active_challenge.metadata = {
+                **active_challenge.metadata,
+                'source': 'manager_login',
+                'manager_user_id': user.id,
+                'ticket_hash': make_password(ticket),
+            }
+            active_challenge.save(update_fields=['metadata', 'updated_at'])
+            logger.info('Manager login OTP reused for %s challenge=%s', mask_phone(phone), active_challenge.id)
+            return ticket, self._with_request_metadata(active_challenge, reused=True)
+
+        self._enforce_rate_limits(phone, ip_address, settings.OTP_PURPOSE_MANAGER_LOGIN)
 
         code = self.generate_otp(phone)
         ticket = secrets.token_urlsafe(32)
@@ -219,6 +257,11 @@ class OTPService:
             }
             challenge.save(update_fields=['status', 'metadata', 'updated_at'])
             logger.warning('Manager login OTP delivery failed for %s challenge=%s', mask_phone(phone), challenge.id)
+            if str(exc.code) == '30':
+                raise OTPRateLimitedError(
+                    'Mobizon request limit exceeded.',
+                    retry_after=settings.OTP_RESEND_COOLDOWN_SECONDS,
+                ) from exc
             raise OTPDeliveryError('OTP delivery failed.') from exc
 
         challenge.status = OTPChallenge.STATUS_SENT
@@ -228,7 +271,7 @@ class OTPService:
         challenge.metadata = {**challenge.metadata, 'mobizon_status': 'accepted'}
         challenge.save(update_fields=['status', 'sent_at', 'mobizon_message_id', 'metadata', 'updated_at'])
         logger.info('Manager login OTP sent for %s challenge=%s', mask_phone(phone), challenge.id)
-        return ticket, challenge
+        return ticket, self._with_request_metadata(challenge, reused=False)
 
     def verify_manager_login_otp(self, phone, ticket, code):
         if not settings.OTP_AUTH_ENABLED:
@@ -331,20 +374,70 @@ class OTPService:
     def _build_sms_text(self, code):
         return f'Baiqymyz verification code: {code}'
 
-    def _enforce_rate_limits(self, phone, ip_address):
+    def _requires_manual_fallback(self, exc):
+        if str(exc.code) != '1' or not isinstance(exc.data, dict):
+            return False
+
+        recipient_error = exc.data.get('recipient')
+        if isinstance(recipient_error, list):
+            recipient_error = ' '.join(str(item) for item in recipient_error)
+        recipient_error = str(recipient_error or '').lower()
+
+        return any(
+            marker in recipient_error
+            for marker in (
+                'отсутствует возможность отправки',
+                'no route',
+                'route unavailable',
+                'sending is unavailable',
+                'невозможно отправить',
+            )
+        )
+
+    def _get_active_challenge(self, phone, purpose):
+        now = timezone.now()
+        return (
+            OTPChallenge.objects.filter(
+                phone=phone,
+                purpose=purpose,
+                status=OTPChallenge.STATUS_SENT,
+                expires_at__gt=now,
+            )
+            .order_by('-created_at')
+            .first()
+        )
+
+    def _with_request_metadata(self, challenge, reused=False):
+        now = timezone.now()
+        resend_anchor = challenge.sent_at or challenge.created_at
+        resend_at = resend_anchor + timedelta(seconds=settings.OTP_RESEND_COOLDOWN_SECONDS)
+
+        challenge.otp_reused = reused
+        challenge.otp_resend_after = max(0, ceil((resend_at - now).total_seconds()))
+        challenge.otp_expires_in = max(0, ceil((challenge.expires_at - now).total_seconds()))
+        return challenge
+
+    def _enforce_rate_limits(self, phone, ip_address, purpose):
         now = timezone.now()
         cooldown_start = now - timedelta(seconds=settings.OTP_RESEND_COOLDOWN_SECONDS)
         daily_start = now - timedelta(days=1)
 
-        if OTPChallenge.objects.filter(phone=phone, created_at__gte=cooldown_start).exists():
-            raise OTPRateLimitedError('Please wait before requesting another OTP.')
+        recent_challenge = (
+            OTPChallenge.objects.filter(phone=phone, purpose=purpose, created_at__gte=cooldown_start)
+            .order_by('-created_at')
+            .first()
+        )
+        if recent_challenge:
+            resend_at = recent_challenge.created_at + timedelta(seconds=settings.OTP_RESEND_COOLDOWN_SECONDS)
+            retry_after = max(1, ceil((resend_at - now).total_seconds()))
+            raise OTPRateLimitedError('Please wait before requesting another OTP.', retry_after=retry_after)
 
-        phone_count = OTPChallenge.objects.filter(phone=phone, created_at__gte=daily_start).count()
+        phone_count = OTPChallenge.objects.filter(phone=phone, purpose=purpose, created_at__gte=daily_start).count()
         if phone_count >= settings.OTP_PHONE_DAILY_LIMIT:
             raise OTPRateLimitedError('OTP request limit exceeded.')
 
         if ip_address:
-            ip_count = OTPChallenge.objects.filter(ip_address=ip_address, created_at__gte=daily_start).count()
+            ip_count = OTPChallenge.objects.filter(ip_address=ip_address, purpose=purpose, created_at__gte=daily_start).count()
             if ip_count >= settings.OTP_IP_DAILY_LIMIT:
                 raise OTPRateLimitedError('OTP request limit exceeded.')
 

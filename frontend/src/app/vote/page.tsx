@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ToastContainer, toast } from "react-toastify";
 import { YMaps, Map, Placemark } from "@pbe/react-yandex-maps";
@@ -41,6 +41,31 @@ type VotingResults = {
   candidates: Candidate[];
 };
 
+type LocationConsentRequest = {
+  resolve: (allowed: boolean) => void;
+};
+
+const LOCATION_CONSENT_SECONDS = 10;
+
+async function getGeolocationPermissionState() {
+  if (
+    typeof navigator === "undefined" ||
+    !navigator.permissions ||
+    !navigator.permissions.query
+  ) {
+    return "unsupported";
+  }
+
+  try {
+    const status = await navigator.permissions.query({
+      name: "geolocation" as PermissionName,
+    });
+    return status.state;
+  } catch {
+    return "unsupported";
+  }
+}
+
 export default function VotePage() {
   const { t } = useTranslation("common");
   const router = useRouter();
@@ -48,8 +73,16 @@ export default function VotePage() {
   const [loading, setLoading] = useState(true);
   const [isVoting, setIsVoting] = useState(false);
   const [isCheckingLocation, setIsCheckingLocation] = useState(false);
+  const [locationConsentRequest, setLocationConsentRequest] =
+    useState<LocationConsentRequest | null>(null);
+  const [locationConsentCountdown, setLocationConsentCountdown] = useState(
+    LOCATION_CONSENT_SECONDS
+  );
+  const locationConsentRequestRef = useRef<LocationConsentRequest | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [pendingCandidate, setPendingCandidate] = useState<Candidate | null>(null);
+  const isLocationConsentOpen = Boolean(locationConsentRequest);
+  const canResolveLocationConsent = locationConsentCountdown <= 0;
 
   const selectedCandidate = useMemo(() => {
     if (!results?.current_vote) return null;
@@ -83,6 +116,17 @@ export default function VotePage() {
       .finally(() => setLoading(false));
   }, [router]);
 
+  useEffect(() => {
+    if (!locationConsentRequest) return;
+
+    setLocationConsentCountdown(LOCATION_CONSENT_SECONDS);
+    const timer = window.setInterval(() => {
+      setLocationConsentCountdown((current) => Math.max(0, current - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [locationConsentRequest]);
+
   const showVoteError = (err: any) => {
     if (err.response?.status === 401) {
       toast.error(t("home.vote_unauthorized"));
@@ -109,7 +153,43 @@ export default function VotePage() {
     toast.error(t("home.vote_error"));
   };
 
+  const requestLocationConsent = () =>
+    new Promise<boolean>((resolve) => {
+      if (locationConsentRequestRef.current) {
+        resolve(false);
+        return;
+      }
+
+      const request = { resolve };
+      locationConsentRequestRef.current = request;
+      setLocationConsentRequest(request);
+    });
+
+  const resolveLocationConsent = (allowed: boolean) => {
+    const request = locationConsentRequestRef.current;
+    if (!canResolveLocationConsent || !request) return;
+    request.resolve(allowed);
+    locationConsentRequestRef.current = null;
+    setLocationConsentRequest(null);
+  };
+
   const getAllowedVotingLocation = async () => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      toast.error(t("home.location_error_unsupported"));
+      return null;
+    }
+
+    const permissionState = await getGeolocationPermissionState();
+    if (permissionState === "denied") {
+      toast.error(t("home.location_error_denied"));
+      return null;
+    }
+
+    if (permissionState !== "granted") {
+      const consentGranted = await requestLocationConsent();
+      if (!consentGranted) return null;
+    }
+
     setIsCheckingLocation(true);
     try {
       const location = await getCurrentCoordinates();
@@ -138,7 +218,7 @@ export default function VotePage() {
   };
 
   const submitVote = async (candidate: Candidate) => {
-    if (!results || isVoting || isCheckingLocation) return;
+    if (!results || isVoting || isCheckingLocation || isLocationConsentOpen) return;
 
     const location = await getAllowedVotingLocation();
     if (!location) {
@@ -165,7 +245,7 @@ export default function VotePage() {
   };
 
   const handleCandidateSelect = (candidate: Candidate) => {
-    if (isVoting || isCheckingLocation) return;
+    if (isVoting || isCheckingLocation || isLocationConsentOpen) return;
     if (selectedCandidate?.id === candidate.id) {
       toast.info(t("home.already_your_vote"));
       return;
@@ -279,7 +359,12 @@ export default function VotePage() {
                       </div>
                       <button
                         type="button"
-                        disabled={isVoting || isCheckingLocation || candidate.is_user_vote}
+                        disabled={
+                          isVoting ||
+                          isCheckingLocation ||
+                          isLocationConsentOpen ||
+                          candidate.is_user_vote
+                        }
                         onClick={() => handleCandidateSelect(candidate)}
                         className="mt-auto h-12 w-full rounded-2xl bg-orange px-6 font-extrabold text-white disabled:bg-orange/50"
                       >
@@ -376,10 +461,56 @@ export default function VotePage() {
               <button
                 type="button"
                 onClick={() => submitVote(pendingCandidate)}
-                disabled={isCheckingLocation || isVoting}
+                disabled={isCheckingLocation || isVoting || isLocationConsentOpen}
                 className="h-12 flex-1 rounded-2xl bg-orange font-extrabold text-white disabled:bg-orange/50"
               >
                 {t("home.confirm")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {locationConsentRequest && (
+        <div className="fixed inset-0 z-[80] bg-black/60 flex items-center justify-center px-4">
+          <div
+            className="w-full max-w-md rounded-2xl bg-white p-6 text-center shadow-lg"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="location-consent-title"
+          >
+            <h2
+              id="location-consent-title"
+              className="mb-4 text-2xl font-extrabold text-orange"
+            >
+              {t("home.location_modal_title")}
+            </h2>
+            <p className="mb-4 text-sm font-bold text-gray-700">
+              {t("home.location_modal_text")}
+            </p>
+            <p className="mb-6 text-sm font-extrabold text-orange">
+              {canResolveLocationConsent
+                ? t("home.location_modal_ready")
+                : t("home.location_modal_countdown", {
+                    seconds: locationConsentCountdown,
+                  })}
+            </p>
+            <div className="grid w-full grid-cols-1 gap-3 md:grid-cols-2">
+              <button
+                type="button"
+                onClick={() => resolveLocationConsent(false)}
+                disabled={!canResolveLocationConsent}
+                className="min-h-14 w-full rounded-2xl border-2 border-orange px-5 py-3 text-center font-extrabold text-orange text-sm leading-tight disabled:border-orange/40 disabled:text-orange/40"
+              >
+                {t("home.location_modal_close")}
+              </button>
+              <button
+                type="button"
+                onClick={() => resolveLocationConsent(true)}
+                disabled={!canResolveLocationConsent}
+                className="min-h-14 w-full rounded-2xl bg-orange px-5 py-3 text-center font-extrabold text-sm text-white leading-tight disabled:bg-orange/50"
+              >
+                {t("home.location_modal_allow")}
               </button>
             </div>
           </div>

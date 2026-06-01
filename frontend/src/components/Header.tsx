@@ -2,14 +2,38 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import AuthService from "~/app/services/auth";
 import LanguageSwitcher from "~/components/LangSwitcher";
 
 function Header() {
   const { t } = useTranslation("common");
+  const router = useRouter();
   const [open, setOpen] = useState(false);
- 
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  useEffect(() => {
+    const syncAuth = () => {
+      setIsAuthenticated(Boolean(localStorage.getItem("authToken")));
+    };
+
+    syncAuth();
+    window.addEventListener("storage", syncAuth);
+    window.addEventListener("auth-changed", syncAuth);
+
+    return () => {
+      window.removeEventListener("storage", syncAuth);
+      window.removeEventListener("auth-changed", syncAuth);
+    };
+  }, []);
+
+  const handleLogout = () => {
+    AuthService.logoutLocal();
+    setOpen(false);
+    router.push("/");
+  };
 
   return (
     <header className="bg-orange h-48 md:h-96 relative overflow-hidden">
@@ -73,7 +97,13 @@ function Header() {
             <Link href="/#program">{t("nav.program")}</Link>
           </li>
           <li className="text-orange md:text-white md:bg-[rgba(255,255,255,0.3)] md:px-2 md:rounded-lg cursor-pointer">
-            <Link href="/login">{t("nav.login_sms")}</Link>
+            {isAuthenticated ? (
+              <button type="button" onClick={handleLogout} className="cursor-pointer">
+                {t("nav.logout")}
+              </button>
+            ) : (
+              <Link href="/login">{t("nav.login_sms")}</Link>
+            )}
           </li>
           <li className="text-orange md:text-white md:bg-[rgba(255,255,255,0.3)] md:px-2 md:rounded-lg cursor-pointer">
             <Link href="/#contacts">{t("nav.contact")}</Link>
