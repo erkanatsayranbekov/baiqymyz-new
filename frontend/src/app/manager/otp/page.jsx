@@ -6,14 +6,10 @@ import { useEffect, useState } from "react";
 import { ToastContainer, toast } from "react-toastify";
 import AuthService from "~/app/services/auth";
 import Button from "~/components/Button";
-import PhoneInput from "~/components/PhoneInput";
 import Section from "~/components/Section";
 import { useTranslation } from "react-i18next";
 
-const PHONE_MASK_OPTIONS = { mask: "+0 (000) 000-00-00" };
-
 /**
- * @typedef {{ phone: string, otp: string }} ManagerOtpResult
  * @typedef {{ username?: string, is_staff?: boolean, is_superuser?: boolean, manager_session_expires_at?: string }} ManagerUser
  * @typedef {{ response?: { status?: number } }} ApiError
  */
@@ -26,11 +22,6 @@ export default function ManagerOtpPage() {
   const [managerUser, setManagerUser] = useState(
     /** @type {ManagerUser | null} */ (null),
   );
-  const [phone, setPhone] = useState("");
-  const [result, setResult] = useState(
-    /** @type {ManagerOtpResult | null} */ (null),
-  );
-  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     const loginUrl = "/manager/login?next=/manager/otp";
@@ -60,69 +51,6 @@ export default function ManagerOtpPage() {
       })
       .finally(() => setCheckingAccess(false));
   }, [router, t]);
-
-  /**
-   * @param {ApiError} error
-   */
-  const showError = (error) => {
-    const status = error?.response?.status;
-    if (status === 400) {
-      toast.error(t("manager.invalid_phone"));
-      return;
-    }
-    if (status === 401) {
-      toast.error(t("manager.unauthorized"));
-      AuthService.logoutManagerLocal();
-      router.push("/manager/login?next=/manager/otp");
-      return;
-    }
-    if (status === 403) {
-      toast.error(t("manager.forbidden"));
-      setAllowed(false);
-      return;
-    }
-    if (status === 429) {
-      toast.error(t("manager.rate_limited"));
-      return;
-    }
-    toast.error(t("manager.server_error"));
-  };
-
-  /**
-   * @param {string} value
-   */
-  const handlePhoneAccept = (value) => {
-    setPhone(value);
-  };
-
-  const handleGenerate = async () => {
-    if (!phone) {
-      toast.error(t("manager.invalid_phone"));
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const response = await AuthService.generateManagerOtp(phone);
-      setResult(response.data);
-      toast.success(t("manager.generated"));
-    } catch (error) {
-      showError(/** @type {ApiError} */ (error));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const copyOtp = async () => {
-    if (!result?.otp) return;
-
-    try {
-      await navigator.clipboard.writeText(result.otp);
-      toast.success(t("manager.copied"));
-    } catch (_error) {
-      toast.error(t("manager.copy_failed"));
-    }
-  };
 
   const logoutManager = () => {
     AuthService.logoutManagerLocal();
@@ -181,50 +109,14 @@ export default function ManagerOtpPage() {
                   {t("manager.logout")}
                 </button>
               </div>
-              <p className="max-w-xl text-center text-sm font-bold text-white/90">
-                {t("manager.description")}
-              </p>
-              <PhoneInput
-                placeholder={t("auth.phone_placeholder")}
-                type="tel"
-                name="phone"
-                id="manager-phone"
-                disabled={loading}
-                maskOptions={PHONE_MASK_OPTIONS}
-                onAccept={handlePhoneAccept}
-              />
-              <Button
-                type="button"
-                onClick={handleGenerate}
-                loading={loading}
-                disabled={loading}
-              >
-                {t("manager.generate")}
-              </Button>
-
-              {result && (
-                <div className="w-full max-w-md rounded-2xl bg-white p-5 text-orange shadow-lg">
-                  <p className="text-sm font-bold text-black/60">
-                    {t("manager.normalized_phone")}
-                  </p>
-                  <p className="mb-4 text-xl font-extrabold">{result.phone}</p>
-                  <p className="text-sm font-bold text-black/60">
-                    {t("manager.otp_code")}
-                  </p>
-                  <div className="mt-1 flex items-center justify-between gap-4">
-                    <p className="tracking-[0.35em] text-4xl font-extrabold">
-                      {result.otp}
-                    </p>
-                    <button
-                      type="button"
-                      className="rounded-xl bg-orange px-4 py-3 text-sm font-extrabold text-white"
-                      onClick={copyOtp}
-                    >
-                      {t("manager.copy")}
-                    </button>
-                  </div>
-                </div>
-              )}
+              <div className="w-full max-w-xl rounded-2xl bg-white p-5 text-center text-orange shadow-lg">
+                <p className="text-lg font-extrabold">
+                  {t("manager.otp_removed_title")}
+                </p>
+                <p className="mt-2 text-sm font-bold text-black/60">
+                  {t("manager.otp_removed_text")}
+                </p>
+              </div>
             </>
           )}
         </div>

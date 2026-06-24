@@ -1,11 +1,13 @@
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from .serializers import (
+    ManagerPasswordLoginSerializer,
     ManagerAuthRequestOTPSerializer,
     ManagerAuthVerifySerializer,
     ManagerOTPGenerateSerializer,
     OTPRequestSerializer,
     OTPVerifySerializer,
+    PhoneAuthSerializer,
     VotingSerializer,
     UserSerializer,
     RegisterSerializer,
@@ -14,6 +16,19 @@ from .serializers import (
     VoteSerializer,
 )
 from .models import CustomUser, ManagerAuthSession, ManagerOTPAuditLog, Participant, Vote, VoteHistory, Voting
+from .phone_auth import (
+    attach_vote_risk_events,
+    clear_auth_cookies,
+    DeviceBindingConflict,
+    create_or_update_phone_session,
+    evaluate_vote_risk,
+    fingerprint_hashes,
+    get_binding_conflict,
+    get_client_ip,
+    revoke_current_voter_session,
+    set_auth_cookies,
+    user_payload,
+)
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import action
 from rest_framework.views import APIView
@@ -37,7 +52,6 @@ from .otp import (
     OTPService,
     OTPVerificationError,
     build_vote_cookie,
-    get_client_ip,
 )
 
 logger = logging.getLogger(__name__)
@@ -197,6 +211,7 @@ def build_voting_results(voting, request=None):
     if user and user.is_authenticated:
         current_vote = (
             Vote.objects.filter(voting=voting, user=user)
+            .exclude(status=Vote.STATUS_REJECTED)
             .select_related('participant')
             .first()
         )
@@ -206,7 +221,7 @@ def build_voting_results(voting, request=None):
         voting.participants.annotate(
             vote_count=Count(
                 'votes',
-                filter=Q(votes__voting=voting, votes__user__isnull=False),
+                filter=Q(votes__voting=voting, votes__user__isnull=False, votes__status__in=Vote.COUNTED_STATUSES),
                 distinct=True,
             )
         ).order_by('-vote_count', 'name')
@@ -238,6 +253,7 @@ def build_voting_results(voting, request=None):
         'current_vote': {
             'id': current_vote.id,
             'participant': current_vote.participant_id,
+            'status': current_vote.status,
         } if current_vote else None,
         'leaders': leaders,
         'candidates': candidates,
@@ -287,7 +303,11 @@ class ParticipantViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = queryset.annotate(
             vote_count=Count(
                 'votes',
-                filter=Q(votes__voting=voting, votes__user__isnull=False) if voting else Q(votes__user__isnull=False),
+                filter=(
+                    Q(votes__voting=voting, votes__user__isnull=False, votes__status__in=Vote.COUNTED_STATUSES)
+                    if voting
+                    else Q(votes__user__isnull=False, votes__status__in=Vote.COUNTED_STATUSES)
+                ),
                 distinct=True,
             )
         )
@@ -304,6 +324,7 @@ class ParticipantViewSet(viewsets.ReadOnlyModelViewSet):
         vote_count = instance.votes.filter(
             voting=voting,
             user__isnull=False,
+            status__in=Vote.COUNTED_STATUSES,
         ).count() if voting else 0
 
         serializer = self.get_serializer(instance)
@@ -334,19 +355,47 @@ def vote_response(vote, detail, changed, response_status):
                 'id': vote.id,
                 'voting': vote.voting_id,
                 'participant': vote.participant_id,
+                'status': vote.status,
+                'risk_score': vote.risk_score,
             },
         },
         status=response_status,
     )
 
 
-def update_existing_vote(vote, participant, latitude, longitude, request):
+def apply_vote_risk_fields(vote, risk_result, fingerprints):
+    vote.status = risk_result['status']
+    vote.risk_score = risk_result['risk_score']
+    vote.review_reason = risk_result['review_reason']
+    vote.phone_hash = risk_result['phone_hash']
+    vote.voter_device = risk_result['device']
+    vote.voter_session = risk_result['voter_session']
+    vote.device_id = risk_result['device_id']
+    vote.browser_fingerprint_hash = fingerprints['browser_fingerprint_hash']
+    vote.soft_fingerprint_hash = fingerprints['soft_fingerprint_hash']
+    vote.network_fingerprint_hash = fingerprints['network_fingerprint_hash']
+    return vote
+
+
+def update_existing_vote(vote, participant, latitude, longitude, request, risk_result, fingerprints):
+    if latitude is None:
+        latitude = vote.latitude
+    if longitude is None:
+        longitude = vote.longitude
+
     if vote.participant_id == participant.id:
         vote.latitude = latitude
         vote.longitude = longitude
         vote.voter_ip = get_client_ip(request)
         vote.voter_fingerprint = getattr(vote.user, 'username', '') or str(vote.user_id)
-        vote.save(update_fields=['latitude', 'longitude', 'voter_ip', 'voter_fingerprint', 'updated_at'])
+        apply_vote_risk_fields(vote, risk_result, fingerprints)
+        vote.save(update_fields=[
+            'latitude', 'longitude', 'voter_ip', 'voter_fingerprint', 'status',
+            'phone_hash', 'voter_device', 'voter_session', 'device_id',
+            'browser_fingerprint_hash', 'soft_fingerprint_hash',
+            'network_fingerprint_hash', 'risk_score', 'review_reason', 'updated_at',
+        ])
+        attach_vote_risk_events(vote, risk_result)
         return vote_response(vote, 'Vote already recorded for this candidate.', False, status.HTTP_200_OK)
 
     previous_participant = vote.participant
@@ -364,12 +413,19 @@ def update_existing_vote(vote, participant, latitude, longitude, request):
     vote.latitude = latitude
     vote.longitude = longitude
     vote.score = 1
-    vote.save(update_fields=['participant', 'voter_ip', 'voter_fingerprint', 'latitude', 'longitude', 'score', 'updated_at'])
+    apply_vote_risk_fields(vote, risk_result, fingerprints)
+    vote.save(update_fields=[
+        'participant', 'voter_ip', 'voter_fingerprint', 'latitude', 'longitude',
+        'score', 'status', 'phone_hash', 'voter_device', 'voter_session', 'device_id',
+        'browser_fingerprint_hash', 'soft_fingerprint_hash',
+        'network_fingerprint_hash', 'risk_score', 'review_reason', 'updated_at',
+    ])
     create_vote_history(vote, previous_participant, participant, request)
+    attach_vote_risk_events(vote, risk_result)
     return vote_response(vote, 'Vote updated.', True, status.HTTP_200_OK)
 
 
-def create_new_vote(voting, participant, user, latitude, longitude, request):
+def create_new_vote(voting, participant, user, latitude, longitude, request, risk_result, fingerprints):
     vote = Vote.objects.create(
         voting=voting,
         user=user,
@@ -379,8 +435,19 @@ def create_new_vote(voting, participant, user, latitude, longitude, request):
         voter_ip=get_client_ip(request),
         latitude=latitude,
         longitude=longitude,
+        status=risk_result['status'],
+        phone_hash=risk_result['phone_hash'],
+        voter_device=risk_result['device'],
+        voter_session=risk_result['voter_session'],
+        device_id=risk_result['device_id'],
+        browser_fingerprint_hash=fingerprints['browser_fingerprint_hash'],
+        soft_fingerprint_hash=fingerprints['soft_fingerprint_hash'],
+        network_fingerprint_hash=fingerprints['network_fingerprint_hash'],
+        risk_score=risk_result['risk_score'],
+        review_reason=risk_result['review_reason'],
     )
     create_vote_history(vote, None, participant, request)
+    attach_vote_risk_events(vote, risk_result)
     return vote_response(vote, 'Vote recorded.', True, status.HTTP_201_CREATED)
 
 
@@ -404,12 +471,27 @@ class VoteViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
+        if not getattr(request, 'voter_session', None):
+            return Response({'detail': 'Active voter session is required.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        fingerprints = fingerprint_hashes(request.data)
+        profile = getattr(request.user, 'voter_profile', None)
+        if profile:
+            binding_conflict = get_binding_conflict(
+                profile,
+                device=getattr(request, 'voter_device', None),
+                fingerprints=fingerprints,
+            )
+            if binding_conflict:
+                return Response(binding_conflict.as_payload(), status=status.HTTP_409_CONFLICT)
+
         serializer = VoteCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         voting = serializer.validated_data['voting']
         participant = serializer.validated_data['participant']
         latitude = serializer.validated_data['latitude']
         longitude = serializer.validated_data['longitude']
+        fingerprints = fingerprint_hashes(serializer.validated_data)
 
         if not voting.is_active():
             logger.warning('Vote attempt in inactive voting user=%s voting=%s', request.user.id, voting.id)
@@ -424,6 +506,12 @@ class VoteViewSet(viewsets.ModelViewSet):
             )
             return Response({'detail': 'Candidate does not belong to this voting.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        existing_vote = (
+            Vote.objects.select_for_update()
+            .filter(voting=voting, user=request.user)
+            .select_related('participant')
+            .first()
+        )
         is_inside_event, distance = validate_vote_location(latitude, longitude)
         if not is_inside_event:
             logger.warning(
@@ -437,19 +525,14 @@ class VoteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        existing_vote = (
-            Vote.objects.select_for_update()
-            .filter(voting=voting, user=request.user)
-            .select_related('participant')
-            .first()
-        )
+        risk_result = evaluate_vote_risk(voting, request.user, participant, request, fingerprints)
 
         if existing_vote:
-            return update_existing_vote(existing_vote, participant, latitude, longitude, request)
+            return update_existing_vote(existing_vote, participant, latitude, longitude, request, risk_result, fingerprints)
 
         try:
             with transaction.atomic():
-                return create_new_vote(voting, participant, request.user, latitude, longitude, request)
+                return create_new_vote(voting, participant, request.user, latitude, longitude, request, risk_result, fingerprints)
         except IntegrityError:
             existing_vote = (
                 Vote.objects.select_for_update()
@@ -457,7 +540,7 @@ class VoteViewSet(viewsets.ModelViewSet):
                 .select_related('participant')
                 .get()
             )
-            return update_existing_vote(existing_vote, participant, latitude, longitude, request)
+            return update_existing_vote(existing_vote, participant, latitude, longitude, request, risk_result, fingerprints)
 
     @action(detail=False, methods=['get'])
     def by_fingerprint(self, request):
@@ -472,7 +555,7 @@ class VoteViewSet(viewsets.ModelViewSet):
         if not voting:
             return Response({'detail': 'No active voting.'}, status=status.HTTP_404_NOT_FOUND)
 
-        vote = Vote.objects.filter(voting=voting, user=request.user).first()
+        vote = Vote.objects.filter(voting=voting, user=request.user).exclude(status=Vote.STATUS_REJECTED).first()
         if not vote:
             return Response({'voting': voting.id, 'vote': None})
 
@@ -481,6 +564,7 @@ class VoteViewSet(viewsets.ModelViewSet):
             'vote': {
                 'id': vote.id,
                 'participant': vote.participant_id,
+                'status': vote.status,
             },
         })
 
@@ -496,6 +580,66 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     queryset = CustomUser.objects.all()
     serializer_class = UserSerializer
     permission_classes = [AllowAny]
+
+
+class PhoneAuthView(APIView):
+    permission_classes = [AllowAny]
+    throttle_scope = 'phone_auth'
+
+    def post(self, request):
+        serializer = PhoneAuthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            session_data = create_or_update_phone_session(
+                serializer.validated_data['phone'],
+                request,
+                serializer.validated_data,
+            )
+        except DeviceBindingConflict as error:
+            return Response(error.as_payload(), status=status.HTTP_409_CONFLICT)
+        user_data = user_payload(
+            session_data['user'],
+            session_data['profile'],
+            session_data['session'],
+        )
+        response = Response(
+            {
+                'detail': 'Phone session created.',
+                'user': user_data,
+                'device_conflict': user_data['device_conflict'],
+                'device_conflict_code': user_data['device_conflict_code'],
+                'bound_phone_mask': user_data['bound_phone_mask'],
+            },
+            status=status.HTTP_200_OK,
+        )
+        set_auth_cookies(response, session_data['session_token'], session_data['device_id'])
+        return response
+
+
+class AuthLogoutView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        revoke_current_voter_session(request)
+        if request.user.is_authenticated and getattr(request, 'auth', None):
+            ManagerAuthSession.objects.filter(
+                user=request.user,
+                token=request.auth,
+                revoked_at__isnull=True,
+            ).update(revoked_at=timezone.now())
+        response = Response({'detail': 'Logged out.'}, status=status.HTTP_200_OK)
+        clear_auth_cookies(response)
+        return response
+
+
+class GoneOTPView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        return Response(
+            {'detail': 'OTP authentication has been removed. Use phone login.'},
+            status=status.HTTP_410_GONE,
+        )
 
 
 class RegisterView(generics.CreateAPIView):
@@ -584,12 +728,45 @@ class AuthMeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        voter_session = getattr(request, 'voter_session', None)
+        return Response(
+            user_payload(request.user, voter_session=voter_session),
+            status=status.HTTP_200_OK,
+        )
+
+
+class ManagerPasswordLoginView(APIView):
+    permission_classes = [AllowAny]
+    throttle_scope = 'manager_login_request'
+
+    def post(self, request):
+        if not settings.MANAGER_AUTH_ENABLED:
+            return Response({'detail': 'Manager authentication is disabled.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        serializer = ManagerPasswordLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone = serializer.validated_data['phone']
+        password = serializer.validated_data['password']
+
+        user = authenticate(request, username=phone, password=password)
+        if not user or not user.is_active or not (user.is_staff or user.is_superuser):
+            return Response({'detail': 'Invalid manager credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        token, _created = Token.objects.get_or_create(user=user)
+        expires_at = timezone.now() + timedelta(seconds=settings.MANAGER_SESSION_TTL_SECONDS)
+        session = ManagerAuthSession.objects.create(
+            user=user,
+            token=token,
+            expires_at=expires_at,
+            ip_address=get_client_ip(request),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:2000],
+        )
+
         return Response(
             {
-                'id': request.user.id,
-                'username': request.user.get_username(),
-                'is_staff': request.user.is_staff,
-                'is_superuser': request.user.is_superuser,
+                'token': token.key,
+                'user': manager_user_payload(user),
+                'expires_at': session.expires_at,
             },
             status=status.HTTP_200_OK,
         )

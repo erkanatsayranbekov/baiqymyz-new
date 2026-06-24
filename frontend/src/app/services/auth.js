@@ -11,23 +11,49 @@ export default class AuthService {
 
   // @ts-ignore
   static async register(phone) {
-    return await api.post("/api/register/", {
-      phone_number: phone,
-    });
+    return await AuthService.loginByPhone(phone);
+  }
+
+  static getFingerprintPayload() {
+    if (typeof window === "undefined") {
+      return {
+        browser_fingerprint: "",
+        soft_fingerprint: "",
+        network_fingerprint: "",
+        signals: {},
+      };
+    }
+
+    const signals = {
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+      language: navigator.language || "",
+      languages: Array.isArray(navigator.languages) ? navigator.languages : [],
+      platform: navigator.platform || "",
+      userAgent: navigator.userAgent || "",
+      screen: {
+        width: window.screen?.width || 0,
+        height: window.screen?.height || 0,
+        colorDepth: window.screen?.colorDepth || 0,
+        pixelRatio: window.devicePixelRatio || 1,
+      },
+      hardwareConcurrency: navigator.hardwareConcurrency || 0,
+      maxTouchPoints: navigator.maxTouchPoints || 0,
+    };
+
+    const stable = JSON.stringify(signals);
+    return {
+      browser_fingerprint: `${signals.userAgent}|${signals.platform}|${signals.language}`,
+      soft_fingerprint: stable,
+      network_fingerprint: `${signals.timezone}|${signals.languages.join(",")}`,
+      signals,
+    };
   }
 
   // @ts-ignore
-  static async requestOtp(phone) {
-    return await api.post("/api/auth/otp/request/", {
+  static async loginByPhone(phone) {
+    return await api.post("/api/auth/phone/", {
       phone,
-    });
-  }
-
-  // @ts-ignore
-  static async verifyOtp(phone, code) {
-    return await api.post("/api/auth/otp/verify/", {
-      phone,
-      code,
+      ...AuthService.getFingerprintPayload(),
     });
   }
 
@@ -36,26 +62,10 @@ export default class AuthService {
   }
 
   // @ts-ignore
-  static async generateManagerOtp(phone) {
-    return await api.post("/api/manager/otp/generate/", {
-      phone,
-    });
-  }
-
-  // @ts-ignore
-  static async requestManagerOtp(phone, password) {
-    return await api.post("/api/manager/auth/request-otp/", {
+  static async loginManager(phone, password) {
+    return await api.post("/api/manager/auth/login/", {
       phone,
       password,
-    });
-  }
-
-  // @ts-ignore
-  static async verifyManagerOtp(phone, ticket, code) {
-    return await api.post("/api/manager/auth/verify/", {
-      phone,
-      ticket,
-      code,
     });
   }
 
@@ -73,7 +83,16 @@ export default class AuthService {
     localStorage.removeItem("authToken");
     localStorage.removeItem("phone");
     localStorage.removeItem("managerSessionExpiresAt");
+    localStorage.removeItem("authState");
     AuthService.notifyAuthChanged();
+  }
+
+  static async logout() {
+    try {
+      await api.post("/api/auth/logout/");
+    } finally {
+      AuthService.logoutLocal();
+    }
   }
 
   static logoutManagerLocal() {

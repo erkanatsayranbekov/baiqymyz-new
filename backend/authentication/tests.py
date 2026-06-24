@@ -1,197 +1,427 @@
-from unittest.mock import patch
 from datetime import timedelta
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError, transaction
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.authtoken.models import Token
-from rest_framework.test import APIRequestFactory
 from rest_framework.test import APITestCase
-from rest_framework.throttling import ScopedRateThrottle
-from django.utils import timezone
 
-from .models import ManagerAuthSession, ManagerOTPAuditLog, OTPChallenge, Participant, Vote, VoteHistory, Voting
-from .otp import OTPDeliveryError, OTPManualFallbackRequired, OTPRateLimitedError, OTPService, OTPVerificationError
-from .serializers import normalize_phone
-from .mobizon import MobizonError
-
-
-class DummyMobizonClient:
-    def __init__(self):
-        self.messages = []
-
-    def send_sms(self, recipient, text):
-        self.messages.append((recipient, text))
-        return {'messageId': 'test-message-id'}
+from .models import (
+    DeviceFingerprintBinding,
+    ManagerAuthSession,
+    RiskEvent,
+    Vote,
+    VoteHistory,
+    VoterDevice,
+    VoterProfile,
+    VoterSession,
+    Voting,
+    Participant,
+)
+from .phone_auth import DEVICE_COOKIE_NAME, SESSION_COOKIE_NAME, hash_value
 
 
-class FailingMobizonClient:
-    def send_sms(self, recipient, text):
-        raise MobizonError('Mobizon rejected SMS.', code=2, data={'recipient': '77001234567', 'text': 'secret code'})
-
-
-class RouteUnavailableMobizonClient:
-    def send_sms(self, recipient, text):
-        raise MobizonError(
-            'Invalid recipient.',
-            code=1,
-            data={'recipient': 'Для данного направления отсутствует возможность отправки SMS.'},
+@override_settings(
+    AUTH_FINGERPRINT_SALT='unit-test-fingerprint-salt',
+    VOTER_SESSION_TTL_SECONDS=60 * 60 * 24 * 30,
+    MANAGER_AUTH_ENABLED=True,
+    MANAGER_SESSION_TTL_SECONDS=28800,
+)
+class PhoneOnlyAuthTests(APITestCase):
+    def phone_login(self, phone='+7 (700) 123-45-67', browser_fingerprint='browser-a', soft_fingerprint='soft-a'):
+        return self.client.post(
+            '/api/auth/phone/',
+            {
+                'phone': phone,
+                'browser_fingerprint': browser_fingerprint,
+                'soft_fingerprint': soft_fingerprint,
+                'network_fingerprint': 'network-a',
+                'signals': {'timezone': 'Asia/Almaty', 'platform': 'test'},
+            },
+            format='json',
+            HTTP_HOST='localhost',
+            HTTP_USER_AGENT='phone-auth-test',
+            REMOTE_ADDR='127.0.0.1',
         )
 
+    def test_phone_login_creates_user_profile_device_session_and_cookies(self):
+        response = self.phone_login()
 
-class RateLimitedMobizonClient:
-    def send_sms(self, recipient, text):
-        raise MobizonError('Too many requests.', code=30, data={'limit': 'method'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(SESSION_COOKIE_NAME, response.cookies)
+        self.assertIn(DEVICE_COOKIE_NAME, response.cookies)
+        self.assertEqual(response.data['user']['phone_number'], '77001234567')
+        self.assertTrue(get_user_model().objects.filter(username='77001234567').exists())
+        self.assertTrue(VoterProfile.objects.filter(phone_number='77001234567').exists())
+        self.assertEqual(VoterDevice.objects.count(), 1)
+        self.assertEqual(VoterSession.objects.count(), 1)
+        device = VoterDevice.objects.get()
+        self.assertEqual(device.metadata['bound_phone_mask'], '+7 700 *** ** 67')
+        self.assertEqual(device.metadata['bound_phone_hash'], VoterProfile.objects.get(phone_number='77001234567').phone_hash)
+        self.assertEqual(DeviceFingerprintBinding.objects.count(), 1)
+        self.assertEqual(DeviceFingerprintBinding.objects.get().phone_mask, '+7 700 *** ** 67')
+
+    def test_repeated_login_on_same_device_reuses_device_and_rotates_session(self):
+        self.phone_login()
+        first_device_id = self.client.cookies[DEVICE_COOKIE_NAME].value
+        first_session = VoterSession.objects.get()
+
+        response = self.phone_login()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.cookies[DEVICE_COOKIE_NAME].value, first_device_id)
+        self.assertEqual(VoterDevice.objects.count(), 1)
+        self.assertEqual(VoterSession.objects.filter(revoked_at__isnull=True).count(), 1)
+        first_session.refresh_from_db()
+        self.assertIsNotNone(first_session.revoked_at)
+
+    def test_same_cookie_device_with_different_phone_is_blocked(self):
+        self.phone_login('+7 (700) 123-45-67')
+        response = self.phone_login('+7 (700) 765-43-21')
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data['code'], 'DEVICE_BOUND_TO_OTHER_PHONE')
+        self.assertEqual(response.data['bound_phone_mask'], '+7 700 *** ** 67')
+        self.assertEqual(VoterSession.objects.filter(revoked_at__isnull=True).count(), 1)
+
+    def test_auth_me_returns_device_conflict_for_second_phone_on_same_device(self):
+        self.phone_login('+7 (700) 123-45-67')
+        user = get_user_model().objects.create_user(username='77007654321')
+        VoterProfile.objects.create(
+            user=user,
+            phone_number='77007654321',
+            phone_hash=hash_value('77007654321'),
+        )
+        session = VoterSession.objects.get()
+        session.user = user
+        session.save(update_fields=['user'])
+
+        response = self.client.get('/api/auth/me/', HTTP_HOST='localhost')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['device_conflict'])
+        self.assertEqual(response.data['device_conflict_code'], 'DEVICE_BOUND_TO_OTHER_PHONE')
+        self.assertEqual(response.data['bound_phone_mask'], '+7 700 *** ** 67')
+
+    def test_missing_cookie_but_matching_fingerprint_is_blocked(self):
+        self.phone_login('+7 (700) 123-45-67', browser_fingerprint='shared-browser', soft_fingerprint='shared-soft')
+        self.client.cookies.clear()
+
+        response = self.phone_login('+7 (700) 765-43-21', browser_fingerprint='shared-browser', soft_fingerprint='shared-soft')
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data['code'], 'DEVICE_BOUND_TO_OTHER_PHONE')
+        self.assertEqual(response.data['bound_phone_mask'], '+7 700 *** ** 67')
+
+    def test_logout_revokes_session_and_clears_cookies(self):
+        self.phone_login()
+        session = VoterSession.objects.get()
+
+        response = self.client.post('/api/auth/logout/', {}, format='json', HTTP_HOST='localhost')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        session.refresh_from_db()
+        self.assertIsNotNone(session.revoked_at)
+        self.assertEqual(response.cookies[SESSION_COOKIE_NAME].value, '')
+        self.assertEqual(response.cookies[DEVICE_COOKIE_NAME].value, '')
+
+    def test_otp_endpoints_are_gone(self):
+        request_response = self.client.post('/api/auth/otp/request/', {'phone': '+77001234567'}, format='json', HTTP_HOST='localhost')
+        verify_response = self.client.post('/api/auth/otp/verify/', {'phone': '+77001234567', 'code': '123456'}, format='json', HTTP_HOST='localhost')
+
+        self.assertEqual(request_response.status_code, status.HTTP_410_GONE)
+        self.assertEqual(verify_response.status_code, status.HTTP_410_GONE)
 
 
+@override_settings(
+    AUTH_FINGERPRINT_SALT='unit-test-fingerprint-salt',
+    VOTER_SESSION_TTL_SECONDS=60 * 60 * 24 * 30,
+)
 class SingleChoiceVotingTests(APITestCase):
     def setUp(self):
         self.voting = Voting.objects.create(title='Festival voting', status=Voting.STATUS_ACTIVE)
         self.closed_voting = Voting.objects.create(title='Closed voting', status=Voting.STATUS_CLOSED)
-        self.participant_a = Participant.objects.create(
-            voting=self.voting,
-            name='Candidate A',
-            location='A',
-        )
-        self.participant_b = Participant.objects.create(
-            voting=self.voting,
-            name='Candidate B',
-            location='B',
-        )
-        self.other_participant = Participant.objects.create(
-            voting=self.closed_voting,
-            name='Other candidate',
-            location='Other',
-        )
-        self.user = get_user_model().objects.create_user(username='77001112233')
-        self.token = Token.objects.create(user=self.user)
-        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.participant_a = Participant.objects.create(voting=self.voting, name='Candidate A', location='A')
+        self.participant_b = Participant.objects.create(voting=self.voting, name='Candidate B', location='B')
+        self.other_participant = Participant.objects.create(voting=self.closed_voting, name='Other candidate', location='Other')
 
-    def post_vote(self, participant=None, voting=None):
+    def phone_login(self, phone='+7 (700) 111-22-33', browser_fingerprint='browser-a'):
+        return self.client.post(
+            '/api/auth/phone/',
+            {
+                'phone': phone,
+                'browser_fingerprint': browser_fingerprint,
+                'soft_fingerprint': f'{browser_fingerprint}-soft',
+                'network_fingerprint': 'network-a',
+            },
+            format='json',
+            HTTP_HOST='localhost',
+            HTTP_USER_AGENT='vote-test',
+            REMOTE_ADDR='127.0.0.1',
+        )
+
+    def post_vote(
+        self,
+        participant=None,
+        voting=None,
+        latitude=49.459434,
+        longitude=75.484896,
+        browser_fingerprint='browser-a',
+        soft_fingerprint=None,
+        network_fingerprint='network-a',
+        include_coordinates=True,
+    ):
+        payload = {
+            'voting': (voting or self.voting).id,
+            'participant': (participant or self.participant_a).id,
+            'browser_fingerprint': browser_fingerprint,
+            'soft_fingerprint': soft_fingerprint or f'{browser_fingerprint}-soft',
+            'network_fingerprint': network_fingerprint,
+        }
+        if include_coordinates:
+            payload['latitude'] = latitude
+            payload['longitude'] = longitude
+
         return self.client.post(
             '/api/votes/',
-            {
-                'voting': (voting or self.voting).id,
-                'participant': (participant or self.participant_a).id,
-                'latitude': 51.160006,
-                'longitude': 71.426149,
-            },
+            payload,
             format='json',
             HTTP_HOST='localhost',
         )
 
-    def test_authenticated_user_can_vote_first_time(self):
+    def test_phone_session_user_can_vote_first_time(self):
+        self.phone_login()
         response = self.post_vote()
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        vote = Vote.objects.get(voting=self.voting, user=self.user)
-        self.assertEqual(Vote.objects.filter(voting=self.voting, user=self.user).count(), 1)
-        self.assertEqual(vote.latitude, 51.160006)
-        self.assertEqual(vote.longitude, 71.426149)
-        self.assertEqual(VoteHistory.objects.filter(voting=self.voting, user=self.user).count(), 1)
+        vote = Vote.objects.get(voting=self.voting)
+        self.assertEqual(vote.status, Vote.STATUS_ACCEPTED)
+        self.assertEqual(vote.latitude, 49.459434)
+        self.assertEqual(vote.longitude, 75.484896)
+        self.assertEqual(VoteHistory.objects.filter(voting=self.voting, user=vote.user).count(), 1)
 
     def test_same_candidate_vote_is_idempotent(self):
+        self.phone_login()
         self.post_vote()
         response = self.post_vote()
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(response.data['changed'])
-        self.assertEqual(Vote.objects.filter(voting=self.voting, user=self.user).count(), 1)
-        self.assertEqual(VoteHistory.objects.filter(voting=self.voting, user=self.user).count(), 1)
+        self.assertEqual(Vote.objects.filter(voting=self.voting).count(), 1)
+        self.assertEqual(VoteHistory.objects.filter(voting=self.voting).count(), 1)
 
     def test_user_can_change_vote(self):
+        self.phone_login()
         self.post_vote(self.participant_a)
-        response = self.post_vote(self.participant_b)
+        response = self.post_vote(self.participant_b, latitude=49.4595, longitude=75.4850)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        vote = Vote.objects.get(voting=self.voting, user=self.user)
+        vote = Vote.objects.get(voting=self.voting)
         self.assertEqual(vote.participant, self.participant_b)
-        history = VoteHistory.objects.filter(voting=self.voting, user=self.user).order_by('created_at')
+        self.assertEqual(vote.latitude, 49.4595)
+        self.assertEqual(vote.longitude, 75.4850)
+        history = VoteHistory.objects.filter(voting=self.voting, user=vote.user).order_by('created_at')
         self.assertEqual(history.count(), 2)
         self.assertEqual(history.last().previous_participant, self.participant_a)
         self.assertEqual(history.last().new_participant, self.participant_b)
 
+    def test_change_vote_without_coordinates_is_rejected(self):
+        self.phone_login()
+        self.post_vote(self.participant_a)
+        response = self.post_vote(self.participant_b, include_coordinates=False)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('latitude', response.data)
+        self.assertIn('longitude', response.data)
+        self.assertEqual(Vote.objects.get(voting=self.voting).participant, self.participant_a)
+
+    def test_vote_requires_phone_session_cookie(self):
+        response = self.post_vote()
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
     def test_vote_without_coordinates_is_rejected(self):
-        response = self.client.post(
-            '/api/votes/',
-            {
-                'voting': self.voting.id,
-                'participant': self.participant_a.id,
-            },
-            format='json',
-            HTTP_HOST='localhost',
-        )
+        self.phone_login()
+        response = self.post_vote(include_coordinates=False)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('latitude', response.data)
         self.assertIn('longitude', response.data)
 
     def test_vote_with_invalid_coordinates_is_rejected(self):
-        response = self.client.post(
-            '/api/votes/',
-            {
-                'voting': self.voting.id,
-                'participant': self.participant_a.id,
-                'latitude': 120,
-                'longitude': 220,
-            },
-            format='json',
-            HTTP_HOST='localhost',
-        )
+        self.phone_login()
+        response = self.post_vote(latitude=120, longitude=220)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_vote_outside_event_radius_is_rejected(self):
-        response = self.client.post(
-            '/api/votes/',
-            {
-                'voting': self.voting.id,
-                'participant': self.participant_a.id,
-                'latitude': 43.2389,
-                'longitude': 76.8897,
-            },
-            format='json',
-            HTTP_HOST='localhost',
-        )
+        self.phone_login()
+        response = self.post_vote(latitude=43.2389, longitude=76.8897)
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertFalse(Vote.objects.filter(voting=self.voting, user=self.user).exists())
-
-    def test_unauthenticated_user_cannot_vote(self):
-        self.client.credentials()
-        response = self.post_vote()
-
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertFalse(Vote.objects.filter(voting=self.voting).exists())
 
     def test_closed_voting_rejects_vote(self):
+        self.phone_login()
         response = self.post_vote(self.other_participant, self.closed_voting)
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_participant_from_another_voting_is_rejected(self):
+        self.phone_login()
         response = self.post_vote(self.other_participant, self.voting)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_results_count_votes_and_return_tie_leaders(self):
-        other_user = get_user_model().objects.create_user(username='77004445566')
+    def test_duplicate_device_vote_from_different_phone_is_blocked_and_is_excluded_from_results(self):
+        self.phone_login('+7 (700) 111-22-33', browser_fingerprint='shared-browser')
+        first_response = self.post_vote(self.participant_a, browser_fingerprint='shared-browser')
+        self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
+
+        user = get_user_model().objects.create_user(username='77004445566')
+        VoterProfile.objects.create(
+            user=user,
+            phone_number='77004445566',
+            phone_hash=hash_value('77004445566'),
+        )
+        session = VoterSession.objects.get()
+        session.user = user
+        session.save(update_fields=['user'])
+        second_response = self.post_vote(self.participant_b, browser_fingerprint='shared-browser')
+
+        self.assertEqual(second_response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(second_response.data['code'], 'DEVICE_BOUND_TO_OTHER_PHONE')
+        self.assertEqual(second_response.data['bound_phone_mask'], '+7 700 *** ** 33')
+        self.assertFalse(Vote.objects.filter(participant=self.participant_b).exists())
+
+        results = self.client.get(f'/api/votes/results/?voting={self.voting.id}', HTTP_HOST='localhost')
+        self.assertEqual(results.status_code, status.HTTP_200_OK)
+        self.assertEqual(results.data['total_votes'], 1)
+        candidate_b = next(candidate for candidate in results.data['candidates'] if candidate['id'] == self.participant_b.id)
+        self.assertEqual(candidate_b['vote_count'], 0)
+
+    def test_network_fingerprint_match_alone_does_not_make_vote_pending_review(self):
+        previous_user = get_user_model().objects.create_user(username='77009990000')
         Vote.objects.create(
             voting=self.voting,
-            user=self.user,
+            user=previous_user,
+            participant=self.participant_a,
+            voter_fingerprint='77009990000',
+            voter_ip='127.0.0.10',
+            status=Vote.STATUS_ACCEPTED,
+            phone_hash=hash_value('77009990000'),
+            browser_fingerprint_hash=hash_value('previous-browser'),
+            soft_fingerprint_hash=hash_value('previous-soft'),
+            network_fingerprint_hash=hash_value('shared-network'),
+        )
+        self.phone_login('+7 (700) 111-22-33', browser_fingerprint='new-browser')
+
+        response = self.post_vote(
+            self.participant_b,
+            browser_fingerprint='new-browser',
+            soft_fingerprint='new-soft',
+            network_fingerprint='shared-network',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        vote = Vote.objects.get(user__username='77001112233')
+        self.assertEqual(vote.status, Vote.STATUS_ACCEPTED)
+        self.assertEqual(vote.risk_score, 0)
+        self.assertEqual(vote.review_reason, '')
+        self.assertFalse(RiskEvent.objects.filter(vote=vote).exists())
+
+    def test_browser_fingerprint_match_is_low_risk_and_stays_accepted(self):
+        previous_user = get_user_model().objects.create_user(username='77009990000')
+        Vote.objects.create(
+            voting=self.voting,
+            user=previous_user,
+            participant=self.participant_a,
+            voter_fingerprint='77009990000',
+            voter_ip='127.0.0.10',
+            status=Vote.STATUS_ACCEPTED,
+            phone_hash=hash_value('77009990000'),
+            browser_fingerprint_hash=hash_value('shared-browser-risk'),
+            soft_fingerprint_hash=hash_value('previous-soft'),
+            network_fingerprint_hash=hash_value('previous-network'),
+        )
+        self.phone_login('+7 (700) 111-22-33', browser_fingerprint='shared-browser-risk')
+
+        response = self.post_vote(
+            self.participant_b,
+            browser_fingerprint='shared-browser-risk',
+            soft_fingerprint='new-soft',
+            network_fingerprint='new-network',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        vote = Vote.objects.get(user__username='77001112233')
+        self.assertEqual(vote.status, Vote.STATUS_ACCEPTED)
+        self.assertEqual(vote.risk_score, 10)
+        self.assertEqual(vote.review_reason, RiskEvent.EVENT_FINGERPRINT_ALREADY_VOTED)
+        self.assertTrue(
+            RiskEvent.objects.filter(
+                vote=vote,
+                event_type=RiskEvent.EVENT_FINGERPRINT_ALREADY_VOTED,
+                severity=RiskEvent.SEVERITY_LOW,
+            ).exists()
+        )
+
+    def test_soft_fingerprint_match_still_makes_vote_pending_review(self):
+        previous_user = get_user_model().objects.create_user(username='77009990000')
+        Vote.objects.create(
+            voting=self.voting,
+            user=previous_user,
+            participant=self.participant_a,
+            voter_fingerprint='77009990000',
+            voter_ip='127.0.0.10',
+            status=Vote.STATUS_ACCEPTED,
+            phone_hash=hash_value('77009990000'),
+            browser_fingerprint_hash=hash_value('previous-browser'),
+            soft_fingerprint_hash=hash_value('shared-soft-risk'),
+            network_fingerprint_hash=hash_value('previous-network'),
+        )
+        self.phone_login('+7 (700) 111-22-33', browser_fingerprint='new-browser')
+
+        response = self.post_vote(
+            self.participant_b,
+            browser_fingerprint='new-browser',
+            soft_fingerprint='shared-soft-risk',
+            network_fingerprint='new-network',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        vote = Vote.objects.get(user__username='77001112233')
+        self.assertEqual(vote.status, Vote.STATUS_PENDING_REVIEW)
+        self.assertEqual(vote.risk_score, 90)
+        self.assertEqual(vote.review_reason, RiskEvent.EVENT_FINGERPRINT_ALREADY_VOTED)
+        self.assertTrue(
+            RiskEvent.objects.filter(
+                vote=vote,
+                event_type=RiskEvent.EVENT_FINGERPRINT_ALREADY_VOTED,
+                severity=RiskEvent.SEVERITY_HIGH,
+            ).exists()
+        )
+
+    def test_results_count_only_accepted_votes_and_return_tie_leaders(self):
+        user_a = get_user_model().objects.create_user(username='77001112233')
+        user_b = get_user_model().objects.create_user(username='77004445566')
+        Vote.objects.create(
+            voting=self.voting,
+            user=user_a,
             participant=self.participant_a,
             voter_fingerprint='77001112233',
             voter_ip='127.0.0.1',
+            status=Vote.STATUS_ACCEPTED,
         )
         Vote.objects.create(
             voting=self.voting,
-            user=other_user,
+            user=user_b,
             participant=self.participant_b,
             voter_fingerprint='77004445566',
             voter_ip='127.0.0.2',
+            status=Vote.STATUS_ACCEPTED_WITH_FLAG,
         )
         Vote.objects.create(
             voting=self.voting,
@@ -199,6 +429,7 @@ class SingleChoiceVotingTests(APITestCase):
             score=5,
             voter_fingerprint='legacy-rating',
             voter_ip='127.0.0.3',
+            status=Vote.STATUS_PENDING_REVIEW,
         )
 
         response = self.client.get(f'/api/votes/results/?voting={self.voting.id}', HTTP_HOST='localhost')
@@ -209,16 +440,19 @@ class SingleChoiceVotingTests(APITestCase):
         self.assertEqual({candidate['vote_count'] for candidate in response.data['candidates']}, {1})
 
     def test_current_vote_endpoint_returns_user_vote(self):
+        self.phone_login()
         self.post_vote(self.participant_a)
         response = self.client.get(f'/api/votes/current/?voting={self.voting.id}', HTTP_HOST='localhost')
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['vote']['participant'], self.participant_a.id)
+        self.assertEqual(response.data['vote']['status'], Vote.STATUS_ACCEPTED)
 
-    def test_database_unique_constraint_blocks_duplicate_active_vote(self):
+    def test_database_unique_constraint_blocks_duplicate_user_vote(self):
+        user = get_user_model().objects.create_user(username='77001112233')
         Vote.objects.create(
             voting=self.voting,
-            user=self.user,
+            user=user,
             participant=self.participant_a,
             voter_fingerprint='77001112233',
             voter_ip='127.0.0.1',
@@ -228,349 +462,45 @@ class SingleChoiceVotingTests(APITestCase):
             with transaction.atomic():
                 Vote.objects.create(
                     voting=self.voting,
-                    user=self.user,
+                    user=user,
                     participant=self.participant_b,
                     voter_fingerprint='77001112233',
                     voter_ip='127.0.0.2',
                 )
 
 
-@override_settings(
-    OTP_AUTH_ENABLED=True,
-    OTP_SECRET='unit-test-otp-secret',
-    OTP_CODE_LENGTH=6,
-    OTP_TTL_SECONDS=300,
-    OTP_MAX_ATTEMPTS=3,
-    OTP_LOCKOUT_SECONDS=900,
-    OTP_RESEND_COOLDOWN_SECONDS=0,
-    OTP_PHONE_DAILY_LIMIT=100,
-    OTP_IP_DAILY_LIMIT=100,
-    MANAGER_OTP_ENABLED=True,
-    MANAGER_AUTH_ENABLED=True,
-    MANAGER_SESSION_TTL_SECONDS=28800,
-    OTP_PURPOSE_MANAGER_LOGIN='manager_login',
-)
-class DeterministicOTPTests(APITestCase):
-    def setUp(self):
-        self.factory = APIRequestFactory()
-        self.mobizon = DummyMobizonClient()
-        self.service = OTPService(mobizon_client=self.mobizon)
-        self.phone = normalize_phone('+7 (700) 123-45-67')
-
-    def request(self):
-        return self.factory.post(
-            '/api/auth/otp/request/',
-            HTTP_HOST='localhost',
-            HTTP_USER_AGENT='otp-test',
-            REMOTE_ADDR='127.0.0.1',
-        )
-
-    def authenticate(self, user):
-        token = Token.objects.create(user=user)
-        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
-        return token
-
-    def authenticate_manager_session(self, user):
-        token = self.authenticate(user)
-        ManagerAuthSession.objects.create(
-            user=user,
-            token=token,
-            expires_at=timezone.now() + timedelta(hours=1),
-            ip_address='127.0.0.1',
-            user_agent='test',
-        )
-        return token
-
-    def test_same_phone_formats_generate_same_otp(self):
-        phones = [
-            normalize_phone('+77001234567'),
-            normalize_phone('87001234567'),
-            normalize_phone('8 700 123 45 67'),
-        ]
-
-        codes = {self.service.generate_otp(phone) for phone in phones}
-
-        self.assertEqual(len(codes), 1)
-
-    def test_different_phones_generate_different_otps(self):
-        first = self.service.generate_otp(normalize_phone('+77001234567'))
-        second = self.service.generate_otp(normalize_phone('+77007654321'))
-
-        self.assertNotEqual(first, second)
-        self.assertRegex(first, r'^\d{6}$')
-        self.assertRegex(second, r'^\d{6}$')
-
-    def test_missing_otp_secret_is_rejected(self):
-        with override_settings(OTP_SECRET=''):
-            with self.assertRaises(ImproperlyConfigured):
-                OTPService(mobizon_client=self.mobizon).generate_otp(self.phone)
-
-    def test_request_otp_sends_deterministic_code_and_stores_hash_only(self):
-        code = self.service.generate_otp(self.phone)
-
-        challenge = self.service.request_otp(self.phone, self.request())
-
-        self.assertEqual(self.mobizon.messages[0][0], self.phone)
-        self.assertIn(code, self.mobizon.messages[0][1])
-        self.assertNotEqual(challenge.otp_hash, code)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
-        self.assertFalse(challenge.otp_reused)
-        self.assertGreaterEqual(challenge.otp_expires_in, 1)
-
-    @override_settings(OTP_RESEND_COOLDOWN_SECONDS=60)
-    def test_request_otp_reuses_active_challenge_without_resending_sms(self):
-        first_challenge = self.service.request_otp(self.phone, self.request())
-        second_challenge = self.service.request_otp(self.phone, self.request())
-
-        self.assertEqual(first_challenge.id, second_challenge.id)
-        self.assertTrue(second_challenge.otp_reused)
-        self.assertGreaterEqual(second_challenge.otp_resend_after, 1)
-        self.assertEqual(len(self.mobizon.messages), 1)
-
-    def test_mobizon_error_marks_challenge_failed(self):
-        service = OTPService(mobizon_client=FailingMobizonClient())
-
-        with self.assertRaises(OTPDeliveryError):
-            service.request_otp(self.phone, self.request())
-
-        challenge = OTPChallenge.objects.get(phone=self.phone)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_FAILED)
-        self.assertEqual(challenge.metadata['mobizon_code'], 2)
-        self.assertEqual(challenge.metadata['delivery'], 'failed')
-
-    def test_mobizon_rate_limit_is_exposed_as_otp_rate_limit(self):
-        service = OTPService(mobizon_client=RateLimitedMobizonClient())
-
-        with self.assertRaises(OTPRateLimitedError) as context:
-            service.request_otp(self.phone, self.request())
-
-        self.assertEqual(context.exception.retry_after, settings.OTP_RESEND_COOLDOWN_SECONDS)
-        challenge = OTPChallenge.objects.get(phone=self.phone)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_FAILED)
-        self.assertEqual(challenge.metadata['mobizon_code'], 30)
-
-    def test_mobizon_route_unavailable_creates_manual_fallback_challenge(self):
-        service = OTPService(mobizon_client=RouteUnavailableMobizonClient())
-
-        with self.assertRaises(OTPManualFallbackRequired) as context:
-            service.request_otp(self.phone, self.request())
-
-        challenge = context.exception.challenge
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
-        self.assertFalse(challenge.otp_reused)
-        self.assertEqual(challenge.metadata['mobizon_code'], 1)
-        self.assertEqual(challenge.metadata['delivery'], 'manual_fallback')
-
-        code = service.generate_otp(self.phone)
-        token, user, verified_challenge = service.verify_otp(self.phone, code)
-        self.assertTrue(token.key)
-        self.assertEqual(user.username, self.phone)
-        self.assertEqual(verified_challenge.status, OTPChallenge.STATUS_VERIFIED)
-
-    @patch('authentication.otp.MobizonClient', FailingMobizonClient)
-    def test_otp_request_view_returns_delivery_error_when_mobizon_fails(self):
-        response = self.client.post(
-            '/api/auth/otp/request/',
-            {'phone': '+7 (700) 123-45-67'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
-        self.assertEqual(response.data['detail'], 'OTP could not be sent.')
-        challenge = OTPChallenge.objects.get(phone=self.phone)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_FAILED)
-        self.assertEqual(challenge.metadata['delivery'], 'failed')
-
-    @patch('authentication.otp.MobizonClient', RouteUnavailableMobizonClient)
-    def test_otp_request_view_returns_manual_fallback_when_sms_is_undeliverable(self):
-        response = self.client.post(
-            '/api/auth/otp/request/',
-            {'phone': '+7 (700) 123-45-67'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        self.assertTrue(response.data['manual_fallback_required'])
-        self.assertFalse(response.data['reused'])
-        challenge = OTPChallenge.objects.get(phone=self.phone)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
-        self.assertEqual(challenge.metadata['delivery'], 'manual_fallback')
-
-    def test_verify_otp_accepts_deterministic_code(self):
-        self.service.request_otp(self.phone, self.request())
-        code = self.service.generate_otp(self.phone)
-
-        token, user, challenge = self.service.verify_otp(self.phone, code)
-
-        self.assertEqual(user.username, self.phone)
-        self.assertTrue(token.key)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_VERIFIED)
-
-    def test_wrong_otp_increments_attempts_and_locks_challenge(self):
-        self.service.request_otp(self.phone, self.request())
-
-        for _attempt in range(3):
-            with self.assertRaises(OTPVerificationError):
-                self.service.verify_otp(self.phone, '000000')
-
-        challenge = OTPChallenge.objects.get(phone=self.phone)
-        self.assertEqual(challenge.attempt_count, 3)
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_LOCKED)
-        self.assertIsNotNone(challenge.locked_until)
-        self.assertIsNotNone(challenge.last_attempt_at)
-
-        with self.assertRaises(OTPVerificationError):
-            self.service.verify_otp(self.phone, self.service.generate_otp(self.phone))
-
-    def test_manager_endpoint_requires_authentication(self):
-        response = self.client.post(
-            '/api/manager/otp/generate/',
-            {'phone': '+77001234567'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-
-    def test_manager_endpoint_rejects_non_staff_user(self):
-        user = get_user_model().objects.create_user(username='regular-user')
-        self.authenticate(user)
+@override_settings(MANAGER_AUTH_ENABLED=True, MANAGER_SESSION_TTL_SECONDS=28800)
+class ManagerPasswordAuthTests(APITestCase):
+    def test_manager_password_login_creates_manager_session(self):
+        phone = '77001234567'
+        manager = get_user_model().objects.create_user(username=phone, password='manager-pass', is_staff=True)
 
         response = self.client.post(
-            '/api/manager/otp/generate/',
-            {'phone': '+77001234567'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_manager_endpoint_rejects_staff_token_without_manager_session(self):
-        manager = get_user_model().objects.create_user(username='manager', is_staff=True)
-        self.authenticate(manager)
-
-        response = self.client.post(
-            '/api/manager/otp/generate/',
-            {'phone': '+77001234567'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_manager_endpoint_returns_otp_creates_challenge_and_audit_log(self):
-        manager = get_user_model().objects.create_user(username='manager', is_staff=True)
-        self.authenticate_manager_session(manager)
-
-        response = self.client.post(
-            '/api/manager/otp/generate/',
-            {'phone': '+7 (700) 123-45-67'},
-            format='json',
-            HTTP_HOST='localhost',
-            HTTP_USER_AGENT='manager-test',
-            REMOTE_ADDR='127.0.0.5',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data['phone'], self.phone)
-        self.assertEqual(response.data['otp'], self.service.generate_otp(self.phone))
-        self.assertEqual(OTPChallenge.objects.filter(phone=self.phone, status=OTPChallenge.STATUS_SENT).count(), 1)
-
-        audit_log = ManagerOTPAuditLog.objects.get()
-        self.assertEqual(audit_log.manager_user, manager)
-        self.assertEqual(audit_log.phone, self.phone)
-        self.assertEqual(audit_log.result, ManagerOTPAuditLog.RESULT_SUCCESS)
-        self.assertNotEqual(audit_log.error_reason, response.data['otp'])
-
-        self.client.credentials()
-        verify_response = self.client.post(
-            '/api/auth/otp/verify/',
-            {'phone': '+77001234567', 'code': response.data['otp']},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-        self.assertEqual(verify_response.status_code, status.HTTP_200_OK)
-        self.assertTrue(verify_response.data['token'])
-
-    def test_manager_endpoint_writes_validation_error_audit_log(self):
-        manager = get_user_model().objects.create_user(username='manager', is_staff=True)
-        self.authenticate_manager_session(manager)
-
-        response = self.client.post(
-            '/api/manager/otp/generate/',
-            {'phone': 'invalid'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        audit_log = ManagerOTPAuditLog.objects.get()
-        self.assertEqual(audit_log.manager_user, manager)
-        self.assertEqual(audit_log.result, ManagerOTPAuditLog.RESULT_VALIDATION_ERROR)
-        self.assertEqual(audit_log.phone, '')
-
-    def test_manager_endpoint_is_throttled(self):
-        cache.clear()
-        manager = get_user_model().objects.create_user(username='manager', is_staff=True)
-        self.authenticate_manager_session(manager)
-
-        with patch.dict(ScopedRateThrottle.THROTTLE_RATES, {'manager_otp_generate': '1/min'}, clear=False):
-            first_response = self.client.post(
-                '/api/manager/otp/generate/',
-                {'phone': '+77001234567'},
-                format='json',
-                HTTP_HOST='localhost',
-            )
-            second_response = self.client.post(
-                '/api/manager/otp/generate/',
-                {'phone': '+77007654321'},
-                format='json',
-                HTTP_HOST='localhost',
-            )
-
-        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(second_response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
-        self.assertEqual(
-            ManagerOTPAuditLog.objects.filter(result=ManagerOTPAuditLog.RESULT_RATE_LIMITED).count(),
-            1,
-        )
-
-    @patch('authentication.otp.MobizonClient', DummyMobizonClient)
-    def test_manager_auth_request_otp_accepts_staff_password_and_returns_ticket(self):
-        get_user_model().objects.create_user(username=self.phone, password='manager-pass', is_staff=True)
-
-        response = self.client.post(
-            '/api/manager/auth/request-otp/',
+            '/api/manager/auth/login/',
             {'phone': '+7 (700) 123-45-67', 'password': 'manager-pass'},
             format='json',
             HTTP_HOST='localhost',
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data['detail'], 'OTP sent')
-        self.assertTrue(response.data['ticket'])
-        challenge = OTPChallenge.objects.get(phone=self.phone, purpose='manager_login')
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
-        self.assertIn('ticket_hash', challenge.metadata)
-        self.assertNotEqual(challenge.metadata['ticket_hash'], response.data['ticket'])
-        self.assertFalse(response.data['reused'])
-        self.assertGreaterEqual(response.data['expires_in'], 1)
+        self.assertTrue(response.data['token'])
+        self.assertEqual(response.data['user']['username'], phone)
+        token = Token.objects.get(user=manager)
+        self.assertTrue(ManagerAuthSession.objects.filter(user=manager, token=token, revoked_at__isnull=True).exists())
 
-    @patch('authentication.otp.MobizonClient', DummyMobizonClient)
-    def test_manager_auth_request_otp_rejects_wrong_password_and_non_staff_generically(self):
-        get_user_model().objects.create_user(username=self.phone, password='manager-pass', is_staff=True)
+    def test_manager_password_login_rejects_wrong_password_and_non_staff_generically(self):
+        phone = '77001234567'
+        get_user_model().objects.create_user(username=phone, password='manager-pass', is_staff=True)
         get_user_model().objects.create_user(username='77007654321', password='manager-pass', is_staff=False)
 
         wrong_password_response = self.client.post(
-            '/api/manager/auth/request-otp/',
+            '/api/manager/auth/login/',
             {'phone': '+7 (700) 123-45-67', 'password': 'wrong-pass'},
             format='json',
             HTTP_HOST='localhost',
         )
         non_staff_response = self.client.post(
-            '/api/manager/auth/request-otp/',
+            '/api/manager/auth/login/',
             {'phone': '+77007654321', 'password': 'manager-pass'},
             format='json',
             HTTP_HOST='localhost',
@@ -580,79 +510,15 @@ class DeterministicOTPTests(APITestCase):
         self.assertEqual(non_staff_response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertEqual(wrong_password_response.data, non_staff_response.data)
 
-    @patch('authentication.otp.MobizonClient', DummyMobizonClient)
-    def test_manager_auth_verify_creates_manager_session(self):
-        manager = get_user_model().objects.create_user(username=self.phone, password='manager-pass', is_staff=True)
-        request_response = self.client.post(
-            '/api/manager/auth/request-otp/',
-            {'phone': '+7 (700) 123-45-67', 'password': 'manager-pass'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-        code = self.service.generate_otp(self.phone)
-
-        verify_response = self.client.post(
-            '/api/manager/auth/verify/',
-            {'phone': '+7 (700) 123-45-67', 'ticket': request_response.data['ticket'], 'code': code},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-
-        self.assertEqual(verify_response.status_code, status.HTTP_200_OK)
-        self.assertTrue(verify_response.data['token'])
-        self.assertEqual(verify_response.data['user']['username'], self.phone)
-        token = Token.objects.get(user=manager)
-        self.assertTrue(ManagerAuthSession.objects.filter(user=manager, token=token, revoked_at__isnull=True).exists())
-
-    @patch('authentication.otp.MobizonClient', DummyMobizonClient)
-    def test_manager_auth_reuses_active_otp_and_rotates_ticket_without_resending_sms(self):
-        manager = get_user_model().objects.create_user(username=self.phone, password='manager-pass', is_staff=True)
-        service = OTPService(mobizon_client=self.mobizon)
-
-        first_ticket, first_challenge = service.request_manager_login_otp(self.phone, manager, self.request())
-        second_ticket, second_challenge = service.request_manager_login_otp(self.phone, manager, self.request())
-
-        self.assertEqual(first_challenge.id, second_challenge.id)
-        self.assertNotEqual(first_ticket, second_ticket)
-        self.assertTrue(second_challenge.otp_reused)
-        self.assertEqual(len(self.mobizon.messages), 1)
-
-        code = service.generate_otp(self.phone)
-        verified_challenge = service.verify_manager_login_otp(self.phone, second_ticket, code)
-        self.assertEqual(verified_challenge.status, OTPChallenge.STATUS_VERIFIED)
-
-    @patch('authentication.otp.MobizonClient', DummyMobizonClient)
-    def test_manager_auth_verify_rejects_wrong_ticket_and_locks_attempts(self):
-        get_user_model().objects.create_user(username=self.phone, password='manager-pass', is_staff=True)
-        self.client.post(
-            '/api/manager/auth/request-otp/',
-            {'phone': '+7 (700) 123-45-67', 'password': 'manager-pass'},
-            format='json',
-            HTTP_HOST='localhost',
-        )
-        code = self.service.generate_otp(self.phone)
-
-        for _attempt in range(3):
-            response = self.client.post(
-                '/api/manager/auth/verify/',
-                {'phone': '+7 (700) 123-45-67', 'ticket': 'wrong-ticket', 'code': code},
-                format='json',
-                HTTP_HOST='localhost',
-            )
-            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        challenge = OTPChallenge.objects.get(phone=self.phone, purpose='manager_login')
-        self.assertEqual(challenge.status, OTPChallenge.STATUS_LOCKED)
-        self.assertIsNotNone(challenge.locked_until)
-
     def test_manager_auth_me_requires_active_manager_session(self):
-        manager = get_user_model().objects.create_user(username=self.phone, is_staff=True)
-        self.authenticate(manager)
+        phone = '77001234567'
+        manager = get_user_model().objects.create_user(username=phone, is_staff=True)
+        token = Token.objects.create(user=manager)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
 
         response_without_session = self.client.get('/api/manager/auth/me/', HTTP_HOST='localhost')
         self.assertEqual(response_without_session.status_code, status.HTTP_403_FORBIDDEN)
 
-        token = Token.objects.get(user=manager)
         ManagerAuthSession.objects.create(
             user=manager,
             token=token,
@@ -668,4 +534,21 @@ class DeterministicOTPTests(APITestCase):
         )
         active_response = self.client.get('/api/manager/auth/me/', HTTP_HOST='localhost')
         self.assertEqual(active_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(active_response.data['username'], self.phone)
+        self.assertEqual(active_response.data['username'], phone)
+
+    def test_old_manager_otp_endpoints_are_gone(self):
+        response = self.client.post(
+            '/api/manager/auth/request-otp/',
+            {'phone': '+77001234567', 'password': 'manager-pass'},
+            format='json',
+            HTTP_HOST='localhost',
+        )
+        generate_response = self.client.post(
+            '/api/manager/otp/generate/',
+            {'phone': '+77001234567'},
+            format='json',
+            HTTP_HOST='localhost',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_410_GONE)
+        self.assertEqual(generate_response.status_code, status.HTTP_410_GONE)

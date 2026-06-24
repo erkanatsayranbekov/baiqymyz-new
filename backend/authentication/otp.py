@@ -15,7 +15,7 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
 from .models import CustomUser, OTPChallenge
-from .mobizon import MobizonClient, MobizonError, mask_phone, sanitize_mobizon_data
+from .wasender import WasenderClient, WasenderError, mask_phone, sanitize_wasender_data
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +61,8 @@ def build_vote_cookie(phone):
 
 
 class OTPService:
-    def __init__(self, mobizon_client=None):
-        self.mobizon_client = mobizon_client or MobizonClient()
+    def __init__(self, message_client=None):
+        self.message_client = message_client or WasenderClient()
 
     def request_otp(self, phone, request):
         if not settings.OTP_AUTH_ENABLED:
@@ -91,34 +91,31 @@ class OTPService:
         )
 
         try:
-            result = self.mobizon_client.send_sms(phone, self._build_sms_text(code))
-        except MobizonError as exc:
-            is_manual_fallback = self._requires_manual_fallback(exc)
-            challenge.status = OTPChallenge.STATUS_SENT if is_manual_fallback else OTPChallenge.STATUS_FAILED
-            if is_manual_fallback:
-                challenge.sent_at = timezone.now()
+            result = self.message_client.send_message(phone, self._build_whatsapp_text(code))
+        except WasenderError as exc:
+            challenge.status = OTPChallenge.STATUS_FAILED
             challenge.metadata = {
-                'mobizon_code': exc.code,
+                'provider': 'wasenderapi',
+                'wasender_code': exc.code,
                 'error': str(exc),
-                'mobizon_data': sanitize_mobizon_data(exc.data),
-                'delivery': 'manual_fallback' if is_manual_fallback else 'failed',
+                'wasender_data': sanitize_wasender_data(exc.data),
+                'delivery': 'failed',
             }
             challenge.save(update_fields=['status', 'sent_at', 'metadata', 'updated_at'])
             logger.warning('OTP delivery failed for %s challenge=%s', mask_phone(phone), challenge.id)
-            if str(exc.code) == '30':
+            if str(exc.code) == '429':
                 raise OTPRateLimitedError(
-                    'Mobizon request limit exceeded.',
+                    'WhatsApp OTP request limit exceeded.',
                     retry_after=settings.OTP_RESEND_COOLDOWN_SECONDS,
                 ) from exc
-            if is_manual_fallback:
-                raise OTPManualFallbackRequired(challenge=self._with_request_metadata(challenge, reused=False)) from exc
             raise OTPDeliveryError('OTP delivery failed.') from exc
 
         challenge.status = OTPChallenge.STATUS_SENT
         challenge.sent_at = timezone.now()
-        if isinstance(result, dict) and result.get('messageId'):
-            challenge.mobizon_message_id = str(result['messageId'])
-        challenge.metadata = {'mobizon_status': 'accepted'}
+        message_id = self._extract_provider_message_id(result)
+        if message_id:
+            challenge.mobizon_message_id = str(message_id)
+        challenge.metadata = {'provider': 'wasenderapi', 'wasender_status': 'accepted'}
         challenge.save(update_fields=['status', 'sent_at', 'mobizon_message_id', 'metadata', 'updated_at'])
         logger.info('OTP sent for %s challenge=%s', mask_phone(phone), challenge.id)
         return self._with_request_metadata(challenge, reused=False)
@@ -246,29 +243,31 @@ class OTPService:
         )
 
         try:
-            result = self.mobizon_client.send_sms(phone, self._build_sms_text(code))
-        except MobizonError as exc:
+            result = self.message_client.send_message(phone, self._build_whatsapp_text(code))
+        except WasenderError as exc:
             challenge.status = OTPChallenge.STATUS_FAILED
             challenge.metadata = {
                 **challenge.metadata,
-                'mobizon_code': exc.code,
+                'provider': 'wasenderapi',
+                'wasender_code': exc.code,
                 'error': str(exc),
-                'mobizon_data': sanitize_mobizon_data(exc.data),
+                'wasender_data': sanitize_wasender_data(exc.data),
             }
             challenge.save(update_fields=['status', 'metadata', 'updated_at'])
             logger.warning('Manager login OTP delivery failed for %s challenge=%s', mask_phone(phone), challenge.id)
-            if str(exc.code) == '30':
+            if str(exc.code) == '429':
                 raise OTPRateLimitedError(
-                    'Mobizon request limit exceeded.',
+                    'WhatsApp OTP request limit exceeded.',
                     retry_after=settings.OTP_RESEND_COOLDOWN_SECONDS,
                 ) from exc
             raise OTPDeliveryError('OTP delivery failed.') from exc
 
         challenge.status = OTPChallenge.STATUS_SENT
         challenge.sent_at = timezone.now()
-        if isinstance(result, dict) and result.get('messageId'):
-            challenge.mobizon_message_id = str(result['messageId'])
-        challenge.metadata = {**challenge.metadata, 'mobizon_status': 'accepted'}
+        message_id = self._extract_provider_message_id(result)
+        if message_id:
+            challenge.mobizon_message_id = str(message_id)
+        challenge.metadata = {**challenge.metadata, 'provider': 'wasenderapi', 'wasender_status': 'accepted'}
         challenge.save(update_fields=['status', 'sent_at', 'mobizon_message_id', 'metadata', 'updated_at'])
         logger.info('Manager login OTP sent for %s challenge=%s', mask_phone(phone), challenge.id)
         return ticket, self._with_request_metadata(challenge, reused=False)
@@ -371,28 +370,23 @@ class OTPService:
             raise ImproperlyConfigured('OTP_SECRET must be configured.')
         return settings.OTP_SECRET.encode('utf-8')
 
-    def _build_sms_text(self, code):
+    def _build_whatsapp_text(self, code):
         return f'Baiqymyz verification code: {code}'
 
-    def _requires_manual_fallback(self, exc):
-        if str(exc.code) != '1' or not isinstance(exc.data, dict):
-            return False
+    def _extract_provider_message_id(self, result):
+        if not isinstance(result, dict):
+            return ''
 
-        recipient_error = exc.data.get('recipient')
-        if isinstance(recipient_error, list):
-            recipient_error = ' '.join(str(item) for item in recipient_error)
-        recipient_error = str(recipient_error or '').lower()
+        data = result.get('data')
+        candidates = [
+            result.get('msgId'),
+            result.get('messageId'),
+            result.get('id'),
+        ]
+        if isinstance(data, dict):
+            candidates.extend([data.get('msgId'), data.get('messageId'), data.get('id')])
 
-        return any(
-            marker in recipient_error
-            for marker in (
-                'отсутствует возможность отправки',
-                'no route',
-                'route unavailable',
-                'sending is unavailable',
-                'невозможно отправить',
-            )
-        )
+        return next((candidate for candidate in candidates if candidate), '')
 
     def _get_active_challenge(self, phone, purpose):
         now = timezone.now()

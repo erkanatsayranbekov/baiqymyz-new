@@ -70,7 +70,9 @@ export default function HomePage() {
 
   useEffect(() => {
     const syncAuth = () => {
-      setIsAuthenticated(Boolean(localStorage.getItem("authToken")));
+      setIsAuthenticated(
+        Boolean(localStorage.getItem("authState") || localStorage.getItem("authToken"))
+      );
     };
 
     syncAuth();
@@ -83,8 +85,8 @@ export default function HomePage() {
     };
   }, []);
 
-  const handleLogout = () => {
-    AuthService.logoutLocal();
+  const handleLogout = async () => {
+    await AuthService.logout();
     setOpen(false);
     router.push("/");
   };
@@ -92,9 +94,12 @@ export default function HomePage() {
   const closeMenu = () => setOpen(false);
 
   return (
-    <main className="min-h-screen overflow-x-hidden bg-[#f3cf77] bg-[url('/landing/0801_original.png')] bg-repeat">
+    <main
+      className="min-h-screen overflow-x-hidden bg-[#f4a015] bg-repeat"
+      style={{ backgroundImage: "url('/фон задник.png')" }}
+    >
       <div className="mx-auto flex w-full max-w-[1200px] flex-col overflow-hidden bg-[#f6d684] shadow-2xl shadow-amber-950/20">
-        <section className="relative min-h-[700px] overflow-hidden bg-[url('/landing/0801.png')] bg-cover bg-center px-5 py-5 sm:px-8 lg:px-14">
+        <section className="relative min-h-[640px] overflow-hidden bg-[url('/landing/0801.png')] bg-cover bg-center px-5 py-5 sm:px-8 lg:px-14">
           <div className="absolute inset-0 bg-gradient-to-r from-black/55 via-black/25 to-transparent" />
           <div className="absolute inset-x-0 bottom-0 h-36 bg-gradient-to-t from-black/30 to-transparent" />
 
@@ -188,11 +193,11 @@ export default function HomePage() {
             </nav>
           </div>
 
-          <div className="relative z-10 mt-20 flex max-w-2xl flex-col items-start gap-8 lg:mt-24">
+          <div className="relative z-10 mt-10 flex max-w-2xl flex-col items-start gap-5 sm:mt-14 lg:mt-8">
             <p className="rounded-full bg-white/20 px-5 py-2 text-sm font-extrabold uppercase tracking-[0.18em] text-white backdrop-blur-sm">
               {t("landing.event_kicker")}
             </p>
-            <h1 className="text-4xl font-black uppercase leading-tight text-white drop-shadow-[0_4px_16px_rgba(0,0,0,0.85)] sm:text-5xl lg:text-6xl">
+            <h1 className="text-4xl font-black uppercase leading-[1.08] text-white drop-shadow-[0_4px_16px_rgba(0,0,0,0.85)] sm:text-5xl lg:text-[48px]">
               {t("landing.title")}
             </h1>
             <button

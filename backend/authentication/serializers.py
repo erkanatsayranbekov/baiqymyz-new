@@ -20,6 +20,39 @@ class RegisterSerializer(serializers.Serializer):
         return normalize_phone(value)
 
 
+class PhoneAuthSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=32, required=False, allow_blank=True, write_only=True)
+    browser_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    soft_fingerprint = serializers.CharField(max_length=1024, required=False, allow_blank=True)
+    network_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    signals = serializers.JSONField(required=False)
+
+    def validate_phone(self, value):
+        return normalize_phone(value)
+
+    def validate(self, attrs):
+        raw_phone = attrs.get('phone') or attrs.get('phone_number')
+        if not raw_phone:
+            raise serializers.ValidationError({'phone': 'Phone number is required.'})
+        attrs['phone'] = normalize_phone(raw_phone)
+        attrs.pop('phone_number', None)
+        return attrs
+
+    def validate_signals(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Signals must be an object.')
+        return value
+
+
+class ManagerPasswordLoginSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=32)
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate_phone(self, value):
+        return normalize_phone(value)
+
+
 class VotingSerializer(serializers.ModelSerializer):
     is_active = serializers.SerializerMethodField()
 
@@ -48,11 +81,13 @@ class VoteSerializer(serializers.ModelSerializer):
         model = Vote
         fields = [
             'id', 'voting', 'participant', 'user', 'score', 'voter_fingerprint',
-            'voter_ip', 'latitude', 'longitude', 'created_at', 'updated_at'
+            'voter_ip', 'latitude', 'longitude', 'status', 'risk_score',
+            'review_reason', 'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'user', 'score', 'voter_fingerprint', 'voter_ip',
-            'latitude', 'longitude', 'created_at', 'updated_at'
+            'latitude', 'longitude', 'status', 'risk_score', 'review_reason',
+            'created_at', 'updated_at'
         ]
 
 
@@ -61,6 +96,9 @@ class VoteCreateSerializer(serializers.Serializer):
     participant = serializers.PrimaryKeyRelatedField(queryset=Participant.objects.all())
     latitude = serializers.FloatField(min_value=-90, max_value=90)
     longitude = serializers.FloatField(min_value=-180, max_value=180)
+    browser_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    soft_fingerprint = serializers.CharField(max_length=1024, required=False, allow_blank=True)
+    network_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
 
 
 def normalize_phone(value):

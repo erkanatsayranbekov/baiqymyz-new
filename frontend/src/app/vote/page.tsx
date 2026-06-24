@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { ToastContainer, toast } from "react-toastify";
 import { YMaps, Map, Placemark } from "@pbe/react-yandex-maps";
 import ParticipantsService from "~/app/services/participants";
+import AuthService from "~/app/services/auth";
 import Loading from "~/components/Loading";
 import { useTranslation } from "react-i18next";
 import Section from "~/components/Section";
@@ -41,11 +42,19 @@ type VotingResults = {
   candidates: Candidate[];
 };
 
+type AuthUser = {
+  id: number;
+  phone_number: string;
+  device_conflict?: boolean;
+  bound_phone_mask?: string;
+};
+
 type LocationConsentRequest = {
   resolve: (allowed: boolean) => void;
 };
 
 const LOCATION_CONSENT_SECONDS = 10;
+const GEO_WARNING_STORAGE_KEY = "baiqymyzGeoWarningSeen";
 
 async function getGeolocationPermissionState() {
   if (
@@ -71,6 +80,7 @@ export default function VotePage() {
   const router = useRouter();
   const [results, setResults] = useState<VotingResults | null>(null);
   const [loading, setLoading] = useState(true);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [isVoting, setIsVoting] = useState(false);
   const [isCheckingLocation, setIsCheckingLocation] = useState(false);
   const [locationConsentRequest, setLocationConsentRequest] =
@@ -81,7 +91,9 @@ export default function VotePage() {
   const locationConsentRequestRef = useRef<LocationConsentRequest | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [pendingCandidate, setPendingCandidate] = useState<Candidate | null>(null);
+  const [deviceConflict, setDeviceConflict] = useState<{ boundPhoneMask: string } | null>(null);
   const isLocationConsentOpen = Boolean(locationConsentRequest);
+  const isDeviceConflictOpen = Boolean(deviceConflict);
   const canResolveLocationConsent = locationConsentCountdown <= 0;
 
   const selectedCandidate = useMemo(() => {
@@ -89,6 +101,25 @@ export default function VotePage() {
     return results.candidates.find(
       (candidate) => candidate.id === results.current_vote?.participant
     ) ?? null;
+  }, [results]);
+
+  const orderedCandidates = useMemo(() => {
+    if (!results?.candidates) return [];
+
+    const selectedParticipantId = results.current_vote?.participant;
+    if (!selectedParticipantId) return results.candidates;
+
+    const selected = results.candidates.find(
+      (candidate) => candidate.id === selectedParticipantId
+    );
+    if (!selected) return results.candidates;
+
+    return [
+      selected,
+      ...results.candidates.filter(
+        (candidate) => candidate.id !== selectedParticipantId
+      ),
+    ];
   }, [results]);
 
   const loadResults = async (votingId?: number) => {
@@ -102,14 +133,16 @@ export default function VotePage() {
   };
 
   useEffect(() => {
-    const token = localStorage.getItem("authToken");
-    if (!token) {
-      router.push("/login?next=/vote");
-      return;
-    }
-
-    loadResults()
+    AuthService.getMe()
+      .then(({ data }) => {
+        setAuthUser(data);
+        return loadResults();
+      })
       .catch((err) => {
+        if (err?.response?.status === 401 || err?.response?.status === 403) {
+          router.push("/login?next=/vote");
+          return;
+        }
         toast.error(t("home.vote_error"));
         console.error("Error fetching voting results:", err);
       })
@@ -140,6 +173,15 @@ export default function VotePage() {
           ? t("home.location_error_outside")
           : detail || t("home.voting_closed")
       );
+      return;
+    }
+    if (
+      err.response?.status === 409 &&
+      err.response.data?.code === "DEVICE_BOUND_TO_OTHER_PHONE"
+    ) {
+      setDeviceConflict({
+        boundPhoneMask: err.response.data?.bound_phone_mask || "",
+      });
       return;
     }
     if (err.response?.status === 400) {
@@ -185,9 +227,14 @@ export default function VotePage() {
       return null;
     }
 
-    if (permissionState !== "granted") {
+    const hasSeenGeoWarning =
+      typeof window !== "undefined" &&
+      window.localStorage.getItem(GEO_WARNING_STORAGE_KEY) === "true";
+
+    if (permissionState !== "granted" && !hasSeenGeoWarning) {
       const consentGranted = await requestLocationConsent();
       if (!consentGranted) return null;
+      window.localStorage.setItem(GEO_WARNING_STORAGE_KEY, "true");
     }
 
     setIsCheckingLocation(true);
@@ -217,8 +264,35 @@ export default function VotePage() {
     }
   };
 
+  const showDeviceConflict = () => {
+    setPendingCandidate(null);
+    setDeviceConflict({
+      boundPhoneMask: authUser?.bound_phone_mask || "",
+    });
+  };
+
+  const closeDeviceConflict = async () => {
+    setDeviceConflict(null);
+    try {
+      await AuthService.logout();
+    } finally {
+      router.push("/login?next=/vote");
+    }
+  };
+
   const submitVote = async (candidate: Candidate) => {
-    if (!results || isVoting || isCheckingLocation || isLocationConsentOpen) return;
+    if (
+      !results ||
+      isVoting ||
+      isCheckingLocation ||
+      isLocationConsentOpen ||
+      isDeviceConflictOpen
+    ) return;
+
+    if (authUser?.device_conflict) {
+      showDeviceConflict();
+      return;
+    }
 
     const location = await getAllowedVotingLocation();
     if (!location) {
@@ -245,7 +319,11 @@ export default function VotePage() {
   };
 
   const handleCandidateSelect = (candidate: Candidate) => {
-    if (isVoting || isCheckingLocation || isLocationConsentOpen) return;
+    if (isVoting || isCheckingLocation || isLocationConsentOpen || isDeviceConflictOpen) return;
+    if (authUser?.device_conflict) {
+      showDeviceConflict();
+      return;
+    }
     if (selectedCandidate?.id === candidate.id) {
       toast.info(t("home.already_your_vote"));
       return;
@@ -258,7 +336,7 @@ export default function VotePage() {
   };
 
   const filteredCandidates =
-    results?.candidates.filter((candidate) =>
+    orderedCandidates.filter((candidate) =>
       candidate.name.toLowerCase().includes(searchTerm.toLowerCase())
     ) ?? [];
 
@@ -316,7 +394,7 @@ export default function VotePage() {
                   <Loading color="orange" />
                 </div>
               ) : filteredCandidates.length > 0 ? (
-                filteredCandidates.map((candidate) => (
+                filteredCandidates.map((candidate, index) => (
                   <div
                     key={candidate.id}
                     className={`w-full rounded-2xl border-2 flex gap-4 overflow-hidden p-3 ${
@@ -337,6 +415,9 @@ export default function VotePage() {
                     <div className="flex flex-1 flex-col gap-2">
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div>
+                          <span className="mb-2 inline-flex h-7 min-w-10 items-center justify-center rounded-full bg-orange/10 px-3 text-xs font-extrabold text-orange">
+                            #{index + 1}
+                          </span>
                           <p className="text-lg font-extrabold text-left">
                             {candidate.name}
                           </p>
@@ -363,6 +444,7 @@ export default function VotePage() {
                           isVoting ||
                           isCheckingLocation ||
                           isLocationConsentOpen ||
+                          isDeviceConflictOpen ||
                           candidate.is_user_vote
                         }
                         onClick={() => handleCandidateSelect(candidate)}
@@ -461,12 +543,42 @@ export default function VotePage() {
               <button
                 type="button"
                 onClick={() => submitVote(pendingCandidate)}
-                disabled={isCheckingLocation || isVoting || isLocationConsentOpen}
+                disabled={isCheckingLocation || isVoting || isLocationConsentOpen || isDeviceConflictOpen}
                 className="h-12 flex-1 rounded-2xl bg-orange font-extrabold text-white disabled:bg-orange/50"
               >
                 {t("home.confirm")}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {deviceConflict && (
+        <div className="fixed inset-0 z-[90] bg-black/60 flex items-center justify-center px-4">
+          <div
+            className="w-full max-w-md rounded-2xl bg-white p-6 text-center shadow-lg"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="device-conflict-title"
+          >
+            <h2
+              id="device-conflict-title"
+              className="mb-4 text-2xl font-extrabold text-orange"
+            >
+              {t("home.device_conflict_title")}
+            </h2>
+            <p className="mb-6 text-sm font-bold text-gray-700">
+              {t("home.device_conflict_text", {
+                phone: deviceConflict.boundPhoneMask || t("home.device_conflict_unknown_phone"),
+              })}
+            </p>
+            <button
+              type="button"
+              onClick={closeDeviceConflict}
+              className="min-h-14 w-full rounded-2xl bg-orange px-5 py-3 text-center text-sm font-extrabold leading-tight text-white"
+            >
+              {t("home.device_conflict_button")}
+            </button>
           </div>
         </div>
       )}

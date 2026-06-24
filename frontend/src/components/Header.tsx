@@ -16,7 +16,9 @@ function Header() {
 
   useEffect(() => {
     const syncAuth = () => {
-      setIsAuthenticated(Boolean(localStorage.getItem("authToken")));
+      setIsAuthenticated(
+        Boolean(localStorage.getItem("authState") || localStorage.getItem("authToken"))
+      );
     };
 
     syncAuth();
@@ -29,8 +31,8 @@ function Header() {
     };
   }, []);
 
-  const handleLogout = () => {
-    AuthService.logoutLocal();
+  const handleLogout = async () => {
+    await AuthService.logout();
     setOpen(false);
     router.push("/");
   };

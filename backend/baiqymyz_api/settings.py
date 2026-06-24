@@ -91,6 +91,7 @@ INSTALLED_APPS = [
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
+        'authentication.phone_auth.VoterSessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
@@ -118,6 +119,7 @@ REST_FRAMEWORK = {
         'manager_otp_generate': os.environ.get('DRF_MANAGER_OTP_THROTTLE_RATE', '20/hour'),
         'manager_login_request': os.environ.get('DRF_MANAGER_LOGIN_REQUEST_THROTTLE_RATE', '10/hour'),
         'manager_login_verify': os.environ.get('DRF_MANAGER_LOGIN_VERIFY_THROTTLE_RATE', '30/hour'),
+        'phone_auth': os.environ.get('DRF_PHONE_AUTH_THROTTLE_RATE', '60/hour'),
     },
 }
 
@@ -216,12 +218,9 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 SERVE_MEDIA_IN_DJANGO = env_bool("SERVE_MEDIA_IN_DJANGO", DEBUG)
 PARTICIPANTS_LEGACY_UNPAGINATED = env_bool("PARTICIPANTS_LEGACY_UNPAGINATED", True)
 
-MOBIZON_API_BASE_URL = os.environ.get("MOBIZON_API_BASE_URL", "https://api.mobizon.kz/service/")
-MOBIZON_API_KEY = os.environ.get("MOBIZON_API_KEY", "")
-MOBIZON_SENDER = os.environ.get("MOBIZON_SENDER", "")
-MOBIZON_API_OUTPUT = os.environ.get("MOBIZON_API_OUTPUT", "json")
-MOBIZON_API_VERSION = os.environ.get("MOBIZON_API_VERSION", "v1")
-MOBIZON_TIMEOUT_SECONDS = env_int("MOBIZON_TIMEOUT_SECONDS", 5)
+WASENDER_API_BASE_URL = os.environ.get("WASENDER_API_BASE_URL", "https://wasenderapi.com")
+WASENDER_API_KEY = os.environ.get("WASENDER_API_KEY", "")
+WASENDER_TIMEOUT_SECONDS = env_int("WASENDER_TIMEOUT_SECONDS", 5)
 
 OTP_AUTH_ENABLED = env_bool("OTP_AUTH_ENABLED", False)
 LEGACY_PASSWORD_AUTH_ENABLED = env_bool("LEGACY_PASSWORD_AUTH_ENABLED", True)
@@ -242,7 +241,9 @@ OTP_CHALLENGE_RETENTION_DAYS = env_int("OTP_CHALLENGE_RETENTION_DAYS", 7)
 MANAGER_OTP_ENABLED = env_bool("MANAGER_OTP_ENABLED", True)
 MANAGER_AUTH_ENABLED = env_bool("MANAGER_AUTH_ENABLED", True)
 MANAGER_SESSION_TTL_SECONDS = env_int("MANAGER_SESSION_TTL_SECONDS", 28800)
+VOTER_SESSION_TTL_SECONDS = env_int("VOTER_SESSION_TTL_SECONDS", 60 * 60 * 24 * 30)
+AUTH_FINGERPRINT_SALT = os.environ.get("AUTH_FINGERPRINT_SALT", SECRET_KEY)
 
-EVENT_LATITUDE = env_float("EVENT_LATITUDE", 51.160006)
-EVENT_LONGITUDE = env_float("EVENT_LONGITUDE", 71.426149)
-EVENT_VOTE_RADIUS_METERS = env_int("EVENT_VOTE_RADIUS_METERS", 15000)
+EVENT_LATITUDE = env_float("EVENT_LATITUDE", 49.459434)
+EVENT_LONGITUDE = env_float("EVENT_LONGITUDE", 75.484896)
+EVENT_VOTE_RADIUS_METERS = env_int("EVENT_VOTE_RADIUS_METERS", 30000)

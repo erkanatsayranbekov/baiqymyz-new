@@ -1,4 +1,5 @@
 import { api } from "~/utils/axios";
+import AuthService from "~/app/services/auth";
 
 export default class ParticipantsService {
   static async getParticipants() {
@@ -32,14 +33,19 @@ export default class ParticipantsService {
   /**
    * @param {number|string} votingId
    * @param {number|string} participantId
-   * @param {{ latitude: number, longitude: number }} location
+   * @param {{ latitude: number, longitude: number } | null | undefined} location
    */
   static async submitVote(votingId, participantId, location) {
-    return await api.post("/api/votes/", {
+    /** @type {Record<string, unknown>} */
+    const payload = {
       voting: votingId,
       participant: participantId,
-      latitude: location.latitude,
-      longitude: location.longitude,
-    });
+      ...AuthService.getFingerprintPayload(),
+    };
+    if (location) {
+      payload.latitude = location.latitude;
+      payload.longitude = location.longitude;
+    }
+    return await api.post("/api/votes/", payload);
   }
 }
