@@ -94,8 +94,9 @@ class VoteSerializer(serializers.ModelSerializer):
 class VoteCreateSerializer(serializers.Serializer):
     voting = serializers.PrimaryKeyRelatedField(queryset=Voting.objects.all())
     participant = serializers.PrimaryKeyRelatedField(queryset=Participant.objects.all())
-    latitude = serializers.FloatField(min_value=-90, max_value=90)
-    longitude = serializers.FloatField(min_value=-180, max_value=180)
+    latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
+    longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
+    geo_bypass = serializers.BooleanField(required=False, default=False)
     browser_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
     soft_fingerprint = serializers.CharField(max_length=1024, required=False, allow_blank=True)
     network_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
@@ -116,14 +117,27 @@ def normalize_phone(value):
 
 class OTPRequestSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=32)
+    browser_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    soft_fingerprint = serializers.CharField(max_length=1024, required=False, allow_blank=True)
+    network_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    signals = serializers.JSONField(required=False)
 
     def validate_phone(self, value):
         return normalize_phone(value)
+
+    def validate_signals(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Signals must be an object.')
+        return value
 
 
 class OTPVerifySerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=32)
     code = serializers.CharField(max_length=8)
+    browser_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    soft_fingerprint = serializers.CharField(max_length=1024, required=False, allow_blank=True)
+    network_fingerprint = serializers.CharField(max_length=512, required=False, allow_blank=True)
+    signals = serializers.JSONField(required=False)
 
     def validate_phone(self, value):
         return normalize_phone(value)
@@ -131,6 +145,11 @@ class OTPVerifySerializer(serializers.Serializer):
     def validate_code(self, value):
         if not value.isdigit() or len(value) != settings.OTP_CODE_LENGTH:
             raise serializers.ValidationError(f'OTP code must be exactly {settings.OTP_CODE_LENGTH} digits.')
+        return value
+
+    def validate_signals(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Signals must be an object.')
         return value
 
 

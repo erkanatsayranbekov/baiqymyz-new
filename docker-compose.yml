@@ -53,6 +53,13 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_HOST: ${DB_HOST:-postgres}
       DB_PORT: ${DB_PORT:-5432}
+      MOBIZON_API_BASE_URL: ${MOBIZON_API_BASE_URL:-https://api.mobizon.kz}
+      MOBIZON_API_KEY: ${MOBIZON_API_KEY:-}
+      MOBIZON_SENDER: ${MOBIZON_SENDER:-}
+      MOBIZON_TIMEOUT_SECONDS: ${MOBIZON_TIMEOUT_SECONDS:-5}
+      OTP_AUTH_ENABLED: ${OTP_AUTH_ENABLED:-False}
+      PHONE_ONLY_AUTH_ENABLED: ${PHONE_ONLY_AUTH_ENABLED:-False}
+      ALLOW_GEO_BYPASS: ${ALLOW_GEO_BYPASS:-False}
     networks:
       - internal
 
@@ -81,6 +88,13 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_HOST: ${DB_HOST:-postgres}
       DB_PORT: ${DB_PORT:-5432}
+      MOBIZON_API_BASE_URL: ${MOBIZON_API_BASE_URL:-https://api.mobizon.kz}
+      MOBIZON_API_KEY: ${MOBIZON_API_KEY:-}
+      MOBIZON_SENDER: ${MOBIZON_SENDER:-}
+      MOBIZON_TIMEOUT_SECONDS: ${MOBIZON_TIMEOUT_SECONDS:-5}
+      OTP_AUTH_ENABLED: ${OTP_AUTH_ENABLED:-False}
+      PHONE_ONLY_AUTH_ENABLED: ${PHONE_ONLY_AUTH_ENABLED:-False}
+      ALLOW_GEO_BYPASS: ${ALLOW_GEO_BYPASS:-False}
     command: celery -A baiqymyz_api worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-2} --prefetch-multiplier=${CELERY_PREFETCH_MULTIPLIER:-1}
     networks:
       - internal
@@ -110,6 +124,13 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_HOST: ${DB_HOST:-postgres}
       DB_PORT: ${DB_PORT:-5432}
+      MOBIZON_API_BASE_URL: ${MOBIZON_API_BASE_URL:-https://api.mobizon.kz}
+      MOBIZON_API_KEY: ${MOBIZON_API_KEY:-}
+      MOBIZON_SENDER: ${MOBIZON_SENDER:-}
+      MOBIZON_TIMEOUT_SECONDS: ${MOBIZON_TIMEOUT_SECONDS:-5}
+      OTP_AUTH_ENABLED: ${OTP_AUTH_ENABLED:-False}
+      PHONE_ONLY_AUTH_ENABLED: ${PHONE_ONLY_AUTH_ENABLED:-False}
+      ALLOW_GEO_BYPASS: ${ALLOW_GEO_BYPASS:-False}
     command: celery -A baiqymyz_api worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-2} --prefetch-multiplier=${CELERY_PREFETCH_MULTIPLIER:-1}
     networks:
       - internal
@@ -119,11 +140,13 @@ services:
       context: ./frontend
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_DISABLE_GEOLOCATION: ${NEXT_PUBLIC_DISABLE_GEOLOCATION:-false}
     container_name: t3_frontend
     ports:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      - NEXT_PUBLIC_DISABLE_GEOLOCATION=${NEXT_PUBLIC_DISABLE_GEOLOCATION:-false}
     networks:
       - internal
 

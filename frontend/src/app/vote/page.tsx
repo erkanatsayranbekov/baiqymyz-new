@@ -7,6 +7,7 @@ import { ToastContainer, toast } from "react-toastify";
 import { YMaps, Map, Placemark } from "@pbe/react-yandex-maps";
 import ParticipantsService from "~/app/services/participants";
 import AuthService from "~/app/services/auth";
+import { env } from "~/env";
 import Loading from "~/components/Loading";
 import { useTranslation } from "react-i18next";
 import Section from "~/components/Section";
@@ -216,6 +217,10 @@ export default function VotePage() {
   };
 
   const getAllowedVotingLocation = async () => {
+    if (env.NEXT_PUBLIC_DISABLE_GEOLOCATION === "true") {
+      return EVENT_LOCATION;
+    }
+
     if (typeof navigator === "undefined" || !navigator.geolocation) {
       toast.error(t("home.location_error_unsupported"));
       return null;

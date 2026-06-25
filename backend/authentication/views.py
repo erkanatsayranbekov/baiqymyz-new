@@ -15,16 +15,18 @@ from .serializers import (
     VoteCreateSerializer,
     VoteSerializer,
 )
-from .models import CustomUser, ManagerAuthSession, ManagerOTPAuditLog, Participant, Vote, VoteHistory, Voting
+from .models import CustomUser, ManagerAuthSession, ManagerOTPAuditLog, Participant, Vote, VoteHistory, VoterDevice, Voting
 from .phone_auth import (
     attach_vote_risk_events,
     clear_auth_cookies,
+    DEVICE_COOKIE_NAME,
     DeviceBindingConflict,
     create_or_update_phone_session,
     evaluate_vote_risk,
     fingerprint_hashes,
     get_binding_conflict,
     get_client_ip,
+    hash_value,
     revoke_current_voter_session,
     set_auth_cookies,
     user_payload,
@@ -37,6 +39,7 @@ from rest_framework.permissions import AllowAny, BasePermission, IsAdminUser, Is
 import logging
 import math
 from datetime import timedelta
+from types import SimpleNamespace
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.core.files.storage import default_storage
@@ -489,8 +492,21 @@ class VoteViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         voting = serializer.validated_data['voting']
         participant = serializer.validated_data['participant']
-        latitude = serializer.validated_data['latitude']
-        longitude = serializer.validated_data['longitude']
+        geo_bypass_requested = serializer.validated_data.get('geo_bypass', False)
+        if settings.ALLOW_GEO_BYPASS and geo_bypass_requested:
+            latitude = settings.EVENT_LATITUDE
+            longitude = settings.EVENT_LONGITUDE
+        elif 'latitude' not in serializer.validated_data or 'longitude' not in serializer.validated_data:
+            return Response(
+                {
+                    'latitude': ['This field is required.'],
+                    'longitude': ['This field is required.'],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        else:
+            latitude = serializer.validated_data['latitude']
+            longitude = serializer.validated_data['longitude']
         fingerprints = fingerprint_hashes(serializer.validated_data)
 
         if not voting.is_active():
@@ -582,11 +598,25 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     permission_classes = [AllowAny]
 
 
+def get_otp_binding_conflict(request, phone, validated_data):
+    fingerprints = fingerprint_hashes(validated_data)
+    incoming_device_id = request.COOKIES.get(DEVICE_COOKIE_NAME, '')
+    device = None
+    if incoming_device_id:
+        device = VoterDevice.objects.filter(device_cookie_hash=hash_value(incoming_device_id)).first()
+
+    profile = SimpleNamespace(phone_hash=hash_value(phone))
+    return get_binding_conflict(profile, device=device, fingerprints=fingerprints)
+
+
 class PhoneAuthView(APIView):
     permission_classes = [AllowAny]
     throttle_scope = 'phone_auth'
 
     def post(self, request):
+        if not settings.PHONE_ONLY_AUTH_ENABLED:
+            return Response({'detail': 'Phone-only authentication is disabled. Use OTP login.'}, status=status.HTTP_410_GONE)
+
         serializer = PhoneAuthSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
@@ -873,9 +903,14 @@ class OTPRequestView(APIView):
     def post(self, request):
         serializer = OTPRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        phone = serializer.validated_data['phone']
+
+        binding_conflict = get_otp_binding_conflict(request, phone, serializer.validated_data)
+        if binding_conflict:
+            return Response(binding_conflict.as_payload(), status=status.HTTP_409_CONFLICT)
 
         try:
-            challenge = OTPService().request_otp(serializer.validated_data['phone'], request)
+            challenge = OTPService().request_otp(phone, request)
         except OTPDisabledError:
             return Response({'detail': 'OTP authentication is disabled.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except OTPRateLimitedError as error:
@@ -944,28 +979,34 @@ class OTPVerifyView(APIView):
         phone = serializer.validated_data['phone']
 
         try:
-            token, user, _challenge = OTPService().verify_otp(phone, serializer.validated_data['code'])
+            _token, _user, _challenge = OTPService().verify_otp(phone, serializer.validated_data['code'])
         except OTPDisabledError:
             return Response({'detail': 'OTP authentication is disabled.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except OTPVerificationError:
             return Response({'detail': 'Invalid or expired OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            session_data = create_or_update_phone_session(
+                phone,
+                request,
+                serializer.validated_data,
+            )
+        except DeviceBindingConflict as error:
+            return Response(error.as_payload(), status=status.HTTP_409_CONFLICT)
 
+        user_data = user_payload(
+            session_data['user'],
+            session_data['profile'],
+            session_data['session'],
+        )
         response = Response(
             {
-                'token': token.key,
-                'user': {
-                    'id': user.id,
-                    'phone_number': phone,
-                },
+                'detail': 'OTP verified.',
+                'user': user_data,
+                'device_conflict': user_data['device_conflict'],
+                'device_conflict_code': user_data['device_conflict_code'],
+                'bound_phone_mask': user_data['bound_phone_mask'],
             },
             status=status.HTTP_200_OK,
         )
-        response.set_cookie(
-            key="x-unique-vote",
-            value=build_vote_cookie(phone),
-            httponly=True,
-            secure=not settings.DEBUG,
-            samesite="Lax",
-            max_age=60 * 60 * 24 * 30,
-        )
+        set_auth_cookies(response, session_data['session_token'], session_data['device_id'])
         return response

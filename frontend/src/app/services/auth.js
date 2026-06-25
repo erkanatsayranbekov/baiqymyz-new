@@ -11,7 +11,7 @@ export default class AuthService {
 
   // @ts-ignore
   static async register(phone) {
-    return await AuthService.loginByPhone(phone);
+    return await AuthService.requestOtp(phone);
   }
 
   static getFingerprintPayload() {
@@ -53,6 +53,23 @@ export default class AuthService {
   static async loginByPhone(phone) {
     return await api.post("/api/auth/phone/", {
       phone,
+      ...AuthService.getFingerprintPayload(),
+    });
+  }
+
+  // @ts-ignore
+  static async requestOtp(phone) {
+    return await api.post("/api/auth/otp/request/", {
+      phone,
+      ...AuthService.getFingerprintPayload(),
+    });
+  }
+
+  // @ts-ignore
+  static async verifyOtp(phone, code) {
+    return await api.post("/api/auth/otp/verify/", {
+      phone,
+      code,
       ...AuthService.getFingerprintPayload(),
     });
   }

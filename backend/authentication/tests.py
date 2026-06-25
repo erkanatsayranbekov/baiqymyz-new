@@ -1,4 +1,5 @@
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
@@ -11,6 +12,7 @@ from rest_framework.test import APITestCase
 from .models import (
     DeviceFingerprintBinding,
     ManagerAuthSession,
+    OTPChallenge,
     RiskEvent,
     Vote,
     VoteHistory,
@@ -20,6 +22,7 @@ from .models import (
     Voting,
     Participant,
 )
+from .otp import OTPService
 from .phone_auth import DEVICE_COOKIE_NAME, SESSION_COOKIE_NAME, hash_value
 
 
@@ -28,6 +31,7 @@ from .phone_auth import DEVICE_COOKIE_NAME, SESSION_COOKIE_NAME, hash_value
     VOTER_SESSION_TTL_SECONDS=60 * 60 * 24 * 30,
     MANAGER_AUTH_ENABLED=True,
     MANAGER_SESSION_TTL_SECONDS=28800,
+    PHONE_ONLY_AUTH_ENABLED=True,
 )
 class PhoneOnlyAuthTests(APITestCase):
     def phone_login(self, phone='+7 (700) 123-45-67', browser_fingerprint='browser-a', soft_fingerprint='soft-a'):
@@ -127,17 +131,124 @@ class PhoneOnlyAuthTests(APITestCase):
         self.assertEqual(response.cookies[SESSION_COOKIE_NAME].value, '')
         self.assertEqual(response.cookies[DEVICE_COOKIE_NAME].value, '')
 
-    def test_otp_endpoints_are_gone(self):
-        request_response = self.client.post('/api/auth/otp/request/', {'phone': '+77001234567'}, format='json', HTTP_HOST='localhost')
-        verify_response = self.client.post('/api/auth/otp/verify/', {'phone': '+77001234567', 'code': '123456'}, format='json', HTTP_HOST='localhost')
 
-        self.assertEqual(request_response.status_code, status.HTTP_410_GONE)
-        self.assertEqual(verify_response.status_code, status.HTTP_410_GONE)
+@override_settings(
+    AUTH_FINGERPRINT_SALT='unit-test-fingerprint-salt',
+    VOTER_SESSION_TTL_SECONDS=60 * 60 * 24 * 30,
+    OTP_AUTH_ENABLED=True,
+    PHONE_ONLY_AUTH_ENABLED=False,
+    OTP_SECRET='unit-test-otp-secret',
+    OTP_RESEND_COOLDOWN_SECONDS=30,
+    MOBIZON_API_KEY='unit-test-mobizon-key',
+)
+class PublicOTPAuthTests(APITestCase):
+    def otp_payload(self, phone='+7 (700) 123-45-67', browser_fingerprint='browser-a', soft_fingerprint='soft-a'):
+        return {
+            'phone': phone,
+            'browser_fingerprint': browser_fingerprint,
+            'soft_fingerprint': soft_fingerprint,
+            'network_fingerprint': 'network-a',
+            'signals': {'timezone': 'Asia/Almaty', 'platform': 'test'},
+        }
+
+    @patch('authentication.mobizon.MobizonClient.send_message')
+    def test_otp_request_creates_challenge_and_sends_sms_via_mobizon(self, send_message):
+        send_message.return_value = {'code': 0, 'data': {'messageId': 'message-1'}}
+
+        response = self.client.post(
+            '/api/auth/otp/request/',
+            self.otp_payload(),
+            format='json',
+            HTTP_HOST='localhost',
+            HTTP_USER_AGENT='otp-auth-test',
+            REMOTE_ADDR='127.0.0.1',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['detail'], 'OTP sent')
+        self.assertEqual(response.data['resend_after'], 30)
+        challenge = OTPChallenge.objects.get(phone='77001234567')
+        self.assertEqual(challenge.status, OTPChallenge.STATUS_SENT)
+        self.assertEqual(challenge.mobizon_message_id, 'message-1')
+        self.assertEqual(challenge.metadata['provider'], 'mobizon')
+        send_message.assert_called_once()
+
+    @patch('authentication.mobizon.MobizonClient.send_message')
+    def test_otp_verify_sets_voter_session_and_device_cookies(self, send_message):
+        send_message.return_value = {'code': 0, 'data': {'messageId': 'message-1'}}
+        phone = '77001234567'
+        self.client.post(
+            '/api/auth/otp/request/',
+            self.otp_payload(),
+            format='json',
+            HTTP_HOST='localhost',
+            HTTP_USER_AGENT='otp-auth-test',
+            REMOTE_ADDR='127.0.0.1',
+        )
+        code = OTPService().generate_otp(phone)
+
+        response = self.client.post(
+            '/api/auth/otp/verify/',
+            {**self.otp_payload(), 'code': code},
+            format='json',
+            HTTP_HOST='localhost',
+            HTTP_USER_AGENT='otp-auth-test',
+            REMOTE_ADDR='127.0.0.1',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(SESSION_COOKIE_NAME, response.cookies)
+        self.assertIn(DEVICE_COOKIE_NAME, response.cookies)
+        self.assertEqual(response.data['user']['phone_number'], phone)
+        self.assertTrue(VoterSession.objects.filter(user__username=phone, revoked_at__isnull=True).exists())
+
+        me_response = self.client.get('/api/auth/me/', HTTP_HOST='localhost')
+        self.assertEqual(me_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(me_response.data['phone_number'], phone)
+
+    @patch('authentication.mobizon.MobizonClient.send_message')
+    def test_otp_request_with_existing_fingerprint_binding_returns_conflict_without_sms(self, send_message):
+        DeviceFingerprintBinding.objects.create(
+            fingerprint_hash=hash_value('bound-soft'),
+            fingerprint_type='soft',
+            phone_hash=hash_value('77001112233'),
+            phone_mask='+7 700 *** ** 33',
+        )
+
+        response = self.client.post(
+            '/api/auth/otp/request/',
+            self.otp_payload(
+                phone='+7 (700) 444-55-66',
+                browser_fingerprint='new-browser',
+                soft_fingerprint='bound-soft',
+            ),
+            format='json',
+            HTTP_HOST='localhost',
+            HTTP_USER_AGENT='otp-auth-test',
+            REMOTE_ADDR='127.0.0.1',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data['code'], 'DEVICE_BOUND_TO_OTHER_PHONE')
+        self.assertEqual(response.data['bound_phone_mask'], '+7 700 *** ** 33')
+        self.assertFalse(OTPChallenge.objects.exists())
+        send_message.assert_not_called()
+
+    def test_phone_only_endpoint_is_blocked_when_disabled(self):
+        response = self.client.post(
+            '/api/auth/phone/',
+            self.otp_payload(),
+            format='json',
+            HTTP_HOST='localhost',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_410_GONE)
 
 
 @override_settings(
     AUTH_FINGERPRINT_SALT='unit-test-fingerprint-salt',
     VOTER_SESSION_TTL_SECONDS=60 * 60 * 24 * 30,
+    PHONE_ONLY_AUTH_ENABLED=True,
 )
 class SingleChoiceVotingTests(APITestCase):
     def setUp(self):
@@ -172,6 +283,7 @@ class SingleChoiceVotingTests(APITestCase):
         soft_fingerprint=None,
         network_fingerprint='network-a',
         include_coordinates=True,
+        geo_bypass=False,
     ):
         payload = {
             'voting': (voting or self.voting).id,
@@ -180,6 +292,8 @@ class SingleChoiceVotingTests(APITestCase):
             'soft_fingerprint': soft_fingerprint or f'{browser_fingerprint}-soft',
             'network_fingerprint': network_fingerprint,
         }
+        if geo_bypass:
+            payload['geo_bypass'] = True
         if include_coordinates:
             payload['latitude'] = latitude
             payload['longitude'] = longitude
@@ -249,6 +363,16 @@ class SingleChoiceVotingTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('latitude', response.data)
         self.assertIn('longitude', response.data)
+
+    @override_settings(ALLOW_GEO_BYPASS=True)
+    def test_vote_with_dev_geo_bypass_uses_event_coordinates(self):
+        self.phone_login()
+        response = self.post_vote(include_coordinates=False, geo_bypass=True)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        vote = Vote.objects.get(voting=self.voting)
+        self.assertEqual(vote.latitude, 49.459434)
+        self.assertEqual(vote.longitude, 75.484896)
 
     def test_vote_with_invalid_coordinates_is_rejected(self):
         self.phone_login()

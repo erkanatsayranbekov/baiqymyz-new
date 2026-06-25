@@ -1,5 +1,6 @@
 import { api } from "~/utils/axios";
 import AuthService from "~/app/services/auth";
+import { env } from "~/env";
 
 export default class ParticipantsService {
   static async getParticipants() {
@@ -45,6 +46,9 @@ export default class ParticipantsService {
     if (location) {
       payload.latitude = location.latitude;
       payload.longitude = location.longitude;
+    }
+    if (env.NEXT_PUBLIC_DISABLE_GEOLOCATION === "true") {
+      payload.geo_bypass = true;
     }
     return await api.post("/api/votes/", payload);
   }

@@ -14,8 +14,8 @@ from django.utils.crypto import constant_time_compare
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
+from .mobizon import MobizonClient, MobizonError, mask_phone, sanitize_mobizon_data
 from .models import CustomUser, OTPChallenge
-from .wasender import WasenderClient, WasenderError, mask_phone, sanitize_wasender_data
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ def build_vote_cookie(phone):
 
 class OTPService:
     def __init__(self, message_client=None):
-        self.message_client = message_client or WasenderClient()
+        self.message_client = message_client or MobizonClient()
 
     def request_otp(self, phone, request):
         if not settings.OTP_AUTH_ENABLED:
@@ -91,21 +91,21 @@ class OTPService:
         )
 
         try:
-            result = self.message_client.send_message(phone, self._build_whatsapp_text(code))
-        except WasenderError as exc:
+            result = self.message_client.send_message(phone, self._build_sms_text(code))
+        except MobizonError as exc:
             challenge.status = OTPChallenge.STATUS_FAILED
             challenge.metadata = {
-                'provider': 'wasenderapi',
-                'wasender_code': exc.code,
+                'provider': 'mobizon',
+                'mobizon_code': exc.code,
                 'error': str(exc),
-                'wasender_data': sanitize_wasender_data(exc.data),
+                'mobizon_data': sanitize_mobizon_data(exc.data),
                 'delivery': 'failed',
             }
             challenge.save(update_fields=['status', 'sent_at', 'metadata', 'updated_at'])
             logger.warning('OTP delivery failed for %s challenge=%s', mask_phone(phone), challenge.id)
             if str(exc.code) == '429':
                 raise OTPRateLimitedError(
-                    'WhatsApp OTP request limit exceeded.',
+                    'SMS OTP request limit exceeded.',
                     retry_after=settings.OTP_RESEND_COOLDOWN_SECONDS,
                 ) from exc
             raise OTPDeliveryError('OTP delivery failed.') from exc
@@ -115,7 +115,7 @@ class OTPService:
         message_id = self._extract_provider_message_id(result)
         if message_id:
             challenge.mobizon_message_id = str(message_id)
-        challenge.metadata = {'provider': 'wasenderapi', 'wasender_status': 'accepted'}
+        challenge.metadata = {'provider': 'mobizon', 'mobizon_status': 'accepted'}
         challenge.save(update_fields=['status', 'sent_at', 'mobizon_message_id', 'metadata', 'updated_at'])
         logger.info('OTP sent for %s challenge=%s', mask_phone(phone), challenge.id)
         return self._with_request_metadata(challenge, reused=False)
@@ -243,21 +243,21 @@ class OTPService:
         )
 
         try:
-            result = self.message_client.send_message(phone, self._build_whatsapp_text(code))
-        except WasenderError as exc:
+            result = self.message_client.send_message(phone, self._build_sms_text(code))
+        except MobizonError as exc:
             challenge.status = OTPChallenge.STATUS_FAILED
             challenge.metadata = {
                 **challenge.metadata,
-                'provider': 'wasenderapi',
-                'wasender_code': exc.code,
+                'provider': 'mobizon',
+                'mobizon_code': exc.code,
                 'error': str(exc),
-                'wasender_data': sanitize_wasender_data(exc.data),
+                'mobizon_data': sanitize_mobizon_data(exc.data),
             }
             challenge.save(update_fields=['status', 'metadata', 'updated_at'])
             logger.warning('Manager login OTP delivery failed for %s challenge=%s', mask_phone(phone), challenge.id)
             if str(exc.code) == '429':
                 raise OTPRateLimitedError(
-                    'WhatsApp OTP request limit exceeded.',
+                    'SMS OTP request limit exceeded.',
                     retry_after=settings.OTP_RESEND_COOLDOWN_SECONDS,
                 ) from exc
             raise OTPDeliveryError('OTP delivery failed.') from exc
@@ -267,7 +267,7 @@ class OTPService:
         message_id = self._extract_provider_message_id(result)
         if message_id:
             challenge.mobizon_message_id = str(message_id)
-        challenge.metadata = {**challenge.metadata, 'provider': 'wasenderapi', 'wasender_status': 'accepted'}
+        challenge.metadata = {**challenge.metadata, 'provider': 'mobizon', 'mobizon_status': 'accepted'}
         challenge.save(update_fields=['status', 'sent_at', 'mobizon_message_id', 'metadata', 'updated_at'])
         logger.info('Manager login OTP sent for %s challenge=%s', mask_phone(phone), challenge.id)
         return ticket, self._with_request_metadata(challenge, reused=False)
@@ -370,7 +370,7 @@ class OTPService:
             raise ImproperlyConfigured('OTP_SECRET must be configured.')
         return settings.OTP_SECRET.encode('utf-8')
 
-    def _build_whatsapp_text(self, code):
+    def _build_sms_text(self, code):
         return f'Baiqymyz verification code: {code}'
 
     def _extract_provider_message_id(self, result):
@@ -381,10 +381,16 @@ class OTPService:
         candidates = [
             result.get('msgId'),
             result.get('messageId'),
+            result.get('message_id'),
             result.get('id'),
         ]
         if isinstance(data, dict):
-            candidates.extend([data.get('msgId'), data.get('messageId'), data.get('id')])
+            candidates.extend([
+                data.get('msgId'),
+                data.get('messageId'),
+                data.get('message_id'),
+                data.get('id'),
+            ])
 
         return next((candidate for candidate in candidates if candidate), '')
 

@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 import AuthService from "~/app/services/auth";
 import PhoneInput from "~/components/PhoneInput";
 import Button from "~/components/Button";
+import Input from "~/components/Input";
 import Section from "~/components/Section";
 import { useSearchParams } from "next/navigation";
 import { useTranslation } from "react-i18next";
@@ -20,7 +21,10 @@ export default function LoginPage() {
 
   const searchParams = useSearchParams();
   const [phone, setPhone] = useState("");
+  const [otpCode, setOtpCode] = useState("");
+  const [otpRequested, setOtpRequested] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [resendAfter, setResendAfter] = useState(0);
   const [deviceConflict, setDeviceConflict] = useState(
     /** @type {{ boundPhoneMask: string } | null} */ (null)
   );
@@ -38,10 +42,19 @@ export default function LoginPage() {
     if (passwordChanged) toast.success(t("auth.password_changed_success"));
   }, []);
 
+  useEffect(() => {
+    if (!resendAfter) return;
+    const timer = window.setInterval(() => {
+      setResendAfter((current) => Math.max(0, current - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [resendAfter]);
+
   /**
    * @param {any} error
    */
-  const showLoginError = (error) => {
+  const showOtpError = (error) => {
     const status = error?.response?.status;
     if (
       status === 409 &&
@@ -54,13 +67,27 @@ export default function LoginPage() {
       return;
     }
     if (status === 429) {
-      toast.error(t("auth.too_many_requests"));
+      const retryAfter = Number(error?.response?.data?.retry_after || 0);
+      if (retryAfter > 0) {
+        setResendAfter(retryAfter);
+        toast.error(t("auth.otp_too_many_requests_with_retry", { seconds: retryAfter }));
+        return;
+      }
+      toast.error(t("auth.otp_too_many_requests"));
+      return;
+    }
+    if (status === 400) {
+      toast.error(t("auth.otp_invalid_code"));
+      return;
+    }
+    if (status === 503) {
+      toast.error(t("auth.otp_send_error"));
       return;
     }
     toast.error(t("auth.error_login"));
   };
 
-  const handleLogin = async () => {
+  const handleRequestOtp = async () => {
     if (!phone) {
       toast.error(t("auth.phone_placeholder"));
       return;
@@ -68,19 +95,48 @@ export default function LoginPage() {
 
     setLoading(true);
     try {
-      const response = await AuthService.loginByPhone(phone);
+      const response = await AuthService.requestOtp(phone);
+      const retryAfter = Number(response.data?.resend_after || 0);
+      setResendAfter(retryAfter);
+      setOtpRequested(true);
+      toast.success(response.data?.reused ? t("auth.otp_already_sent") : t("auth.otp_sent"));
+    } catch (error) {
+      showOtpError(error);
+      console.error(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyOtp = async () => {
+    if (!otpCode) {
+      toast.error(t("auth.otp_code_placeholder"));
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const response = await AuthService.verifyOtp(phone, otpCode);
       const phoneNumber = response.data?.user?.phone_number;
+      localStorage.removeItem("authToken");
       if (phoneNumber) localStorage.setItem("phone", phoneNumber);
       localStorage.setItem("authState", "authenticated");
       AuthService.notifyAuthChanged();
       toast.success(t("auth.login_success"));
       router.push(nextUrl);
     } catch (error) {
-      showLoginError(error);
+      showOtpError(error);
       console.error(error);
     } finally {
       setLoading(false);
     }
+  };
+
+  /**
+   * @param {React.ChangeEvent<HTMLInputElement>} event
+   */
+  const handleOtpCodeChange = (event) => {
+    setOtpCode(event.currentTarget.value.replace(/\D/g, ""));
   };
 
   return (
@@ -108,21 +164,50 @@ export default function LoginPage() {
               type="tel"
               name="phone"
               id="phone"
-              disabled={loading}
+              disabled={loading || otpRequested}
               value={phone}
               maskOptions={PHONE_MASK_OPTIONS}
               // @ts-ignore
               onAccept={(val) => setPhone(val)}
               pattern="\+7-\(\d{3}\)-\d{3}-\d{2}-\d{2}"
             />
+
+            {otpRequested && (
+              <Input
+                placeholder={t("auth.otp_code_placeholder")}
+                type="tel"
+                inputMode="numeric"
+                name="otp"
+                id="otp"
+                maxLength={6}
+                disabled={loading}
+                value={otpCode}
+                onChange={handleOtpCodeChange}
+              />
+            )}
+
             <Button
               type="button"
-              onClick={handleLogin}
+              onClick={otpRequested ? handleVerifyOtp : handleRequestOtp}
               loading={loading}
               disabled={loading}
             >
-              {t("auth.phone_login_submit")}
+              {otpRequested ? t("auth.otp_verify") : t("auth.otp_get_code")}
             </Button>
+
+            {otpRequested && (
+              <button
+                type="button"
+                disabled={loading || resendAfter > 0}
+                className="text-sm font-bold text-white underline disabled:text-white/50 disabled:no-underline"
+                onClick={handleRequestOtp}
+              >
+                {resendAfter > 0
+                  ? t("auth.otp_resend_after", { seconds: resendAfter })
+                  : t("auth.otp_resend")}
+              </button>
+            )}
+
             <div className="mt-4 border-t border-white/30 pt-4 text-center">
               <p className="mb-2 text-xs font-bold uppercase tracking-[0.16em] text-white/70">
                 {t("auth.staff_access")}
@@ -130,7 +215,7 @@ export default function LoginPage() {
               <button
                 type="button"
                 className="text-sm font-bold text-white underline"
-                onClick={() => router.push("/manager/login?next=/manager/otp")}
+                onClick={() => router.push("/manager/login")}
               >
                 {t("auth.manager_login")}
               </button>
